@@ -13,7 +13,7 @@ from geopy.distance import geodesic
 import aiosqlite
 
 # --- НАСТРОЙКИ ---
-API_TOKEN = os.getenv('BOT_TOKEN')
+API_TOKEN = os.getenv('8484796508:AAHiuOTZT1JbrYBb4BpZn2riBT0AtK2TXnc')
 PORT = int(os.getenv("PORT", 8080)) # Порт для Render
 
 logging.basicConfig(level=logging.INFO)
