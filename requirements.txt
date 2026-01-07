@@ -1,4 +1,4 @@
 aiogram
 geopy
-aiosqlite
+asyncpg
 aiohttp
