@@ -228,12 +228,15 @@ async def handle_admin_action(callback: types.CallbackQuery):
 # --- ЗАПУСК ---
 async def main():
     await init_db()
+    
+    # !!! НОВОЕ: Сбросить Webhook перед запуском Polling !!!
+    await bot.delete_webhook(drop_pending_updates=True) 
+    
     # Запускаем бота и веб-сервер одновременно
     await asyncio.gather(
         dp.start_polling(bot),
         start_http_server()
     )
-
 if __name__ == "__main__":
     try:
         asyncio.run(main())
