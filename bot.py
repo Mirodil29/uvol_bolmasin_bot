@@ -13,8 +13,12 @@ from geopy.distance import geodesic
 import aiosqlite
 
 # --- НАСТРОЙКИ ---
-API_TOKEN = os.getenv('8484796508:AAHiuOTZT1JbrYBb4BpZn2riBT0AtK2TXnc')
+# !!! ВАЖНО: Убедитесь, что переменная BOT_TOKEN установлена на Render !!!
+API_TOKEN = os.getenv('BOT_TOKEN')
 PORT = int(os.getenv("PORT", 8080)) # Порт для Render
+
+# !!! ВАЖНО: ЗАМЕНИТЕ 123456789 на ваш реальный Telegram User ID !!!
+ADMIN_ID = 1031055597 
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
@@ -25,7 +29,7 @@ class Reg(StatesGroup):
     phone = State()
     location = State()
 
-# --- БАЗА ДАННЫХ ---
+# --- БАЗА ДАННЫХ (SQLite) ---
 async def init_db():
     async with aiosqlite.connect('uvol_bolmasin.db') as db:
         await db.execute('''CREATE TABLE IF NOT EXISTS users 
@@ -141,7 +145,11 @@ async def handle_booking(callback: types.CallbackQuery):
 
 @dp.message(Command("add"))
 async def add_rest(message: types.Message):
-    # Упрощенная проверка админа (через ENV или ID)
+    # Доступно только администратору
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Access denied.")
+        return
+
     try:
         p = message.text.split(maxsplit=3)
         # /add Name Lat Lon
@@ -152,6 +160,70 @@ async def add_rest(message: types.Message):
         await message.answer(f"✅ Ресторан {p[1]} добавлен (5 наборов)!")
     except Exception:
         await message.answer("Ошибка! Формат: /add Название 41.31 69.27")
+
+# --- НОВЫЕ ФУНКЦИИ АДМИНИСТРАТОРА ---
+
+@dp.message(Command("admin"))
+async def admin_panel(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Access denied.")
+        return
+
+    async with aiosqlite.connect('uvol_bolmasin.db') as db:
+        async with db.execute('SELECT id, name, boxes FROM rests ORDER BY id') as cursor:
+            rests = await cursor.fetchall()
+    
+    if not rests:
+        await message.answer("Нет добавленных ресторанов в базе данных.")
+        return
+
+    text = "⚙️ **Панель Управления Ресторанами** ⚙️\n\n"
+    buttons = []
+    
+    for r in rests:
+        rest_id, name, boxes = r
+        text += f"📍 **{name}** | Наборов: **{boxes}** | ID: {rest_id}\n"
+        
+        buttons.append([
+            InlineKeyboardButton(text=f"➕ Добавить 5 наборов в {name}", callback_data=f"admin_add_5_{rest_id}")
+        ])
+
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@dp.callback_query(F.data.startswith("admin_"))
+async def handle_admin_action(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("У вас нет прав администратора.", show_alert=True)
+        return
+    
+    parts = callback.data.split("_")
+    action = parts[1]
+    amount = int(parts[2])
+    rest_id = int(parts[3])
+    
+    if action == 'add':
+        async with aiosqlite.connect('uvol_bolmasin.db') as db:
+            # Обновление и получение нового количества
+            await db.execute('UPDATE rests SET boxes = boxes + ? WHERE id = ?', (amount, rest_id))
+            await db.commit()
+            
+            async with db.execute('SELECT name, boxes FROM rests WHERE id = ?', (rest_id,)) as cursor:
+                res = await cursor.fetchone()
+        
+        if res:
+            name, new_boxes = res
+            
+            await callback.message.edit_text(
+                f"✅ Наборы обновлены!\n"
+                f"📍 Ресторан: **{name}**\n"
+                f"Новое кол-во наборов: **{new_boxes}**",
+                reply_markup=callback.message.reply_markup
+            )
+        else:
+             await callback.answer("Ошибка: Ресторан не найден.", show_alert=True)
+            
+    await callback.answer()
 
 # --- ЗАПУСК ---
 async def main():
