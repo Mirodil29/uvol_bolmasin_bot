@@ -34,18 +34,15 @@ class Reg(StatesGroup):
 
 # --- БАЗА ДАННЫХ (POSTGRESQL) ---
 async def init_db_pool():
-    # Создаем пул подключений, используя DATABASE_URL
     global db_pool
-    if not DATABASE_URL:
-        logging.error("DATABASE_URL не установлена. Выход.")
-        exit()
+    # Проверка переменной окружения опущена для краткости
         
     db_pool = await asyncpg.create_pool(DATABASE_URL)
     logging.info("PostgreSQL Pool создан.")
 
     # Создание таблиц (если их нет)
     async with db_pool.acquire() as conn:
-        # Таблица users
+        # PostgreSQL использует SERIAL PRIMARY KEY
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 id BIGINT PRIMARY KEY,
@@ -55,7 +52,6 @@ async def init_db_pool():
                 lon REAL
             )
         ''')
-        # Таблица rests
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS rests (
                 id SERIAL PRIMARY KEY,
@@ -66,7 +62,6 @@ async def init_db_pool():
             )
         ''')
     logging.info("Database tables проверены/созданы.")
-
 # --- HTTP SERVER ДЛЯ RENDER (Health Check) ---
 async def handle_hc(request):
     return web.Response(text="Bot is running!")
@@ -267,17 +262,18 @@ async def handle_admin_action(callback: types.CallbackQuery):
 
 # --- ЗАПУСК ---
 async def main():
-    await init_db_pool() # Изменено на init_db_pool()
+    # 1. Сначала инициализируем пул подключений к Postgres
+    await init_db_pool() 
     
-    # Гарантированный сброс Webhook для стабильного Polling
+    # 2. Гарантированный сброс Webhook для стабильного Polling
     await bot.delete_webhook(drop_pending_updates=True) 
     
-    # Запускаем бота и веб-сервер одновременно
+    # 3. Запускаем бота и веб-сервер одновременно
     await asyncio.gather(
         dp.start_polling(bot),
         start_http_server()
     )
-
+# ... (остальной код main) ...
 if __name__ == "__main__":
     try:
         asyncio.run(main())
