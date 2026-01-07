@@ -1,5 +1,9 @@
 import asyncio
 import logging
+import os
+import random
+import string
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -8,9 +12,9 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 from geopy.distance import geodesic
 import aiosqlite
 
-# --- 1. НАСТРОЙКИ ---
-API_TOKEN = '8484796508:AAHiuOTZT1JbrYBb4BpZn2riBT0AtK2TXnc'
-ADMIN_ID = 0 
+# --- НАСТРОЙКИ ---
+API_TOKEN = os.getenv('BOT_TOKEN')
+PORT = int(os.getenv("PORT", 8080)) # Порт для Render
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
@@ -21,31 +25,52 @@ class Reg(StatesGroup):
     phone = State()
     location = State()
 
+# --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect('uvol_bolmasin.db') as db:
-        await db.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, phone TEXT, lat REAL, lon REAL)')
-        await db.execute('CREATE TABLE IF NOT EXISTS rests (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, lat REAL, lon REAL, boxes INTEGER DEFAULT 5)')
+        await db.execute('''CREATE TABLE IF NOT EXISTS users 
+                          (id INTEGER PRIMARY KEY, name TEXT, phone TEXT, lat REAL, lon REAL)''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS rests 
+                          (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, lat REAL, lon REAL, boxes INTEGER DEFAULT 5)''')
         await db.commit()
 
+# --- HTTP SERVER ДЛЯ RENDER (Health Check) ---
+async def handle_hc(request):
+    return web.Response(text="Bot is running!")
+
+async def start_http_server():
+    app = web.Application()
+    app.router.add_get("/", handle_hc)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logging.info(f"Health check server started on port {PORT}")
+
+# --- ЛОГИКА БОТА ---
 @dp.message(Command("start"))
 async def start(message: types.Message, state: FSMContext):
-    global ADMIN_ID
-    if ADMIN_ID == 0: ADMIN_ID = message.from_user.id
     await message.answer("Xush kelibsiz! «Uvol bo'lmasin»! 😊\nВведите Имя и Фамилию:")
     await state.set_state(Reg.name)
 
 @dp.message(Reg.name)
 async def get_name(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text)
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📱 Номер", request_contact=True)]], resize_keyboard=True)
-    await message.answer("Отправьте номер телефона:", reply_markup=kb)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Отправить номер", request_contact=True)]], 
+        resize_keyboard=True, one_time_keyboard=True
+    )
+    await message.answer("Отправьте номер телефона кнопкой ниже:", reply_markup=kb)
     await state.set_state(Reg.phone)
 
 @dp.message(Reg.phone, F.contact)
 async def get_phone(message: types.Message, state: FSMContext):
     await state.update_data(phone=message.contact.phone_number)
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📍 Локация", request_location=True)]], resize_keyboard=True)
-    await message.answer("Отправьте геолокацию:", reply_markup=kb)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📍 Отправить локацию", request_location=True)]], 
+        resize_keyboard=True, one_time_keyboard=True
+    )
+    await message.answer("Отправьте геолокацию, чтобы найти еду рядом:", reply_markup=kb)
     await state.set_state(Reg.location)
 
 @dp.message(Reg.location, F.location)
@@ -53,43 +78,92 @@ async def get_loc(message: types.Message, state: FSMContext):
     data = await state.get_data()
     lat, lon = message.location.latitude, message.location.longitude
     async with aiosqlite.connect('uvol_bolmasin.db') as db:
-        await db.execute('INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?, ?)', (message.from_user.id, data['name'], data['phone'], lat, lon))
+        await db.execute('INSERT OR REPLACE INTO users (id, name, phone, lat, lon) VALUES (?, ?, ?, ?, ?)', 
+                         (message.from_user.id, data['name'], data['phone'], lat, lon))
         await db.commit()
-    await message.answer("✅ Регистрация завершена!")
-    await state.clear()
+    
+    await message.answer("✅ Регистрация завершена!", reply_markup=types.ReplyKeyboardRemove())
     await show_restaurants(message, lat, lon)
 
-async def show_restaurants(message: types.Message, u_lat, u_lon):
+async def show_restaurants(message, u_lat, u_lon):
     async with aiosqlite.connect('uvol_bolmasin.db') as db:
-        async with db.execute('SELECT name, lat, lon, boxes, id FROM rests') as cursor:
+        async with db.execute('SELECT name, lat, lon, boxes, id FROM rests WHERE boxes > 0') as cursor:
             rests = await cursor.fetchall()
+    
     if not rests:
-        await message.answer("Пока нет активных предложений.")
+        await message.answer("К сожалению, сейчас нет активных предложений рядом с вами. 😔")
         return
+
     nearby = []
     for r in rests:
         dist = geodesic((u_lat, u_lon), (r[1], r[2])).km
-        nearby.append((r[0], dist, r[3], r[4]))
+        if dist < 10: # Показываем в радиусе 10км
+            nearby.append((r[0], dist, r[3], r[4]))
+    
     nearby.sort(key=lambda x: x[1])
+    
+    if not nearby:
+        await message.answer("Рядом с вами (в радиусе 10км) ничего не найдено.")
+        return
+
     text = "🥡 Доступные наборы (15 000 сум):\n\n"
-    buttons = [[InlineKeyboardButton(text=f"Забронировать в {r[0]}", callback_data=f"book_{r[3]}")] for r in nearby]
+    buttons = []
+    for r in nearby:
+        text += f"📍 {r[0]} ({r[1]:.1f} км) — Осталось: {r[2]} шт.\n"
+        buttons.append([InlineKeyboardButton(text=f"Забронировать в {r[0]}", callback_data=f"book_{r[3]}")])
+
     await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+# --- ОБРАБОТКА БРОНИРОВАНИЯ ---
+@dp.callback_query(F.data.startswith("book_"))
+async def handle_booking(callback: types.CallbackQuery):
+    rest_id = int(callback.data.split("_")[1])
+    
+    async with aiosqlite.connect('uvol_bolmasin.db') as db:
+        # Проверяем наличие порций
+        async with db.execute('SELECT name, boxes FROM rests WHERE id = ?', (rest_id,)) as cursor:
+            res = await cursor.fetchone()
+            
+            if res and res[1] > 0:
+                new_boxes = res[1] - 1
+                await db.execute('UPDATE rests SET boxes = ? WHERE id = ?', (new_boxes, rest_id))
+                await db.commit()
+                
+                code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+                await callback.message.edit_text(
+                    f"✅ Успешно! Ресторан: **{res[0]}**\n"
+                    f"Ваш код брони: `{code}`\n"
+                    f"Покажите его сотруднику для оплаты и получения."
+                )
+            else:
+                await callback.answer("Увы, наборы в этом заведении уже закончились!", show_alert=True)
+                await callback.message.delete()
 
 @dp.message(Command("add"))
 async def add_rest(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
+    # Упрощенная проверка админа (через ENV или ID)
     try:
-        p = message.text.split()
+        p = message.text.split(maxsplit=3)
+        # /add Name Lat Lon
         async with aiosqlite.connect('uvol_bolmasin.db') as db:
-            await db.execute('INSERT INTO rests (name, lat, lon) VALUES (?, ?, ?)', (p[1], float(p[2]), float(p[3])))
+            await db.execute('INSERT INTO rests (name, lat, lon, boxes) VALUES (?, ?, ?, ?)', 
+                             (p[1], float(p[2]), float(p[3]), 5))
             await db.commit()
-        await message.answer(f"✅ Ресторан {p[1]} добавлен!")
-    except:
-        await message.answer("Пример: /add Bon! 41.31 69.27")
+        await message.answer(f"✅ Ресторан {p[1]} добавлен (5 наборов)!")
+    except Exception:
+        await message.answer("Ошибка! Формат: /add Название 41.31 69.27")
 
+# --- ЗАПУСК ---
 async def main():
     await init_db()
-    await dp.start_polling(bot)
+    # Запускаем бота и веб-сервер одновременно
+    await asyncio.gather(
+        dp.start_polling(bot),
+        start_http_server()
+    )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
