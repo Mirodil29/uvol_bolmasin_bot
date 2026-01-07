@@ -3,6 +3,8 @@ import logging
 import os
 import random
 import string
+# --- ИМПОРТЫ: asyncpg вместо aiosqlite ---
+import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -10,15 +12,16 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from geopy.distance import geodesic
-import aiosqlite
 
 # --- НАСТРОЙКИ ---
-# !!! ВАЖНО: Убедитесь, что переменная BOT_TOKEN установлена на Render !!!
 API_TOKEN = os.getenv('BOT_TOKEN')
-PORT = int(os.getenv("PORT", 8080)) # Порт для Render
+PORT = int(os.getenv("PORT", 8080))
+DATABASE_URL = os.getenv('DATABASE_URL') # Переменная для Neon
+# !!! ВАЖНО: Убедитесь, что ваш ADMIN_ID указан правильно !!!
+ADMIN_ID = 1031055597
 
-# !!! ВАЖНО: ЗАМЕНИТЕ 123456789 на ваш реальный Telegram User ID !!!
-ADMIN_ID = 1031055597 
+# Глобальная переменная для пула подключений к БД (будет установлена в main)
+db_pool: asyncpg.Pool = None
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
@@ -29,14 +32,40 @@ class Reg(StatesGroup):
     phone = State()
     location = State()
 
-# --- БАЗА ДАННЫХ (SQLite) ---
-async def init_db():
-    async with aiosqlite.connect('uvol_bolmasin.db') as db:
-        await db.execute('''CREATE TABLE IF NOT EXISTS users 
-                          (id INTEGER PRIMARY KEY, name TEXT, phone TEXT, lat REAL, lon REAL)''')
-        await db.execute('''CREATE TABLE IF NOT EXISTS rests 
-                          (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, lat REAL, lon REAL, boxes INTEGER DEFAULT 5)''')
-        await db.commit()
+# --- БАЗА ДАННЫХ (POSTGRESQL) ---
+async def init_db_pool():
+    # Создаем пул подключений, используя DATABASE_URL
+    global db_pool
+    if not DATABASE_URL:
+        logging.error("DATABASE_URL не установлена. Выход.")
+        exit()
+        
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    logging.info("PostgreSQL Pool создан.")
+
+    # Создание таблиц (если их нет)
+    async with db_pool.acquire() as conn:
+        # Таблица users
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGINT PRIMARY KEY,
+                name TEXT,
+                phone TEXT,
+                lat REAL,
+                lon REAL
+            )
+        ''')
+        # Таблица rests
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS rests (
+                id SERIAL PRIMARY KEY,
+                name TEXT,
+                lat REAL,
+                lon REAL,
+                boxes INTEGER DEFAULT 5
+            )
+        ''')
+    logging.info("Database tables проверены/созданы.")
 
 # --- HTTP SERVER ДЛЯ RENDER (Health Check) ---
 async def handle_hc(request):
@@ -81,18 +110,23 @@ async def get_phone(message: types.Message, state: FSMContext):
 async def get_loc(message: types.Message, state: FSMContext):
     data = await state.get_data()
     lat, lon = message.location.latitude, message.location.longitude
-    async with aiosqlite.connect('uvol_bolmasin.db') as db:
-        await db.execute('INSERT OR REPLACE INTO users (id, name, phone, lat, lon) VALUES (?, ?, ?, ?, ?)', 
-                         (message.from_user.id, data['name'], data['phone'], lat, lon))
-        await db.commit()
+    
+    # --- ЛОГИКА БД (asyncpg) ---
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            'INSERT INTO users (id, name, phone, lat, lon) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO UPDATE SET name=$2, phone=$3, lat=$4, lon=$5',
+            message.from_user.id, data['name'], data['phone'], lat, lon
+        )
+    # --- КОНЕЦ ЛОГИКИ БД ---
     
     await message.answer("✅ Регистрация завершена!", reply_markup=types.ReplyKeyboardRemove())
     await show_restaurants(message, lat, lon)
 
 async def show_restaurants(message, u_lat, u_lon):
-    async with aiosqlite.connect('uvol_bolmasin.db') as db:
-        async with db.execute('SELECT name, lat, lon, boxes, id FROM rests WHERE boxes > 0') as cursor:
-            rests = await cursor.fetchall()
+    # --- ЛОГИКА БД (asyncpg) ---
+    async with db_pool.acquire() as conn:
+        rests = await conn.fetch('SELECT name, lat, lon, boxes, id FROM rests WHERE boxes > 0')
+    # --- КОНЕЦ ЛОГИКИ БД ---
     
     if not rests:
         await message.answer("К сожалению, сейчас нет активных предложений рядом с вами. 😔")
@@ -100,8 +134,10 @@ async def show_restaurants(message, u_lat, u_lon):
 
     nearby = []
     for r in rests:
+        # r[1] = lat, r[2] = lon
         dist = geodesic((u_lat, u_lon), (r[1], r[2])).km
         if dist < 10: # Показываем в радиусе 10км
+            # r[0]=name, r[3]=boxes, r[4]=id
             nearby.append((r[0], dist, r[3], r[4]))
     
     nearby.sort(key=lambda x: x[1])
@@ -123,29 +159,29 @@ async def show_restaurants(message, u_lat, u_lon):
 async def handle_booking(callback: types.CallbackQuery):
     rest_id = int(callback.data.split("_")[1])
     
-    async with aiosqlite.connect('uvol_bolmasin.db') as db:
-        # Проверяем наличие порций
-        async with db.execute('SELECT name, boxes FROM rests WHERE id = ?', (rest_id,)) as cursor:
-            res = await cursor.fetchone()
-            
-            if res and res[1] > 0:
-                new_boxes = res[1] - 1
-                await db.execute('UPDATE rests SET boxes = ? WHERE id = ?', (new_boxes, rest_id))
-                await db.commit()
-                
-                code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-                await callback.message.edit_text(
-                    f"✅ Успешно! Ресторан: **{res[0]}**\n"
-                    f"Ваш код брони: `{code}`\n"
-                    f"Покажите его сотруднику для оплаты и получения."
-                )
-            else:
-                await callback.answer("Увы, наборы в этом заведении уже закончились!", show_alert=True)
-                await callback.message.delete()
+    # --- ЛОГИКА БД (asyncpg) ---
+    async with db_pool.acquire() as conn:
+        # Обновляем и возвращаем имя и новое кол-во порций
+        res = await conn.fetchrow(
+            'UPDATE rests SET boxes = boxes - 1 WHERE id = $1 AND boxes > 0 RETURNING name, boxes',
+            rest_id
+        )
+    # --- КОНЕЦ ЛОГИКИ БД ---
+        
+    if res:
+        name, new_boxes = res
+        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        await callback.message.edit_text(
+            f"✅ Успешно! Ресторан: **{name}**\n"
+            f"Ваш код брони: `{code}`\n"
+            f"Покажите его сотруднику для оплаты и получения."
+        )
+    else:
+        await callback.answer("Увы, наборы в этом заведении уже закончились!", show_alert=True)
+        await callback.message.delete()
 
 @dp.message(Command("add"))
 async def add_rest(message: types.Message):
-    # Доступно только администратору
     if message.from_user.id != ADMIN_ID:
         await message.answer("Access denied.")
         return
@@ -153,15 +189,18 @@ async def add_rest(message: types.Message):
     try:
         p = message.text.split(maxsplit=3)
         # /add Name Lat Lon
-        async with aiosqlite.connect('uvol_bolmasin.db') as db:
-            await db.execute('INSERT INTO rests (name, lat, lon, boxes) VALUES (?, ?, ?, ?)', 
-                             (p[1], float(p[2]), float(p[3]), 5))
-            await db.commit()
+        # --- ЛОГИКА БД (asyncpg) ---
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                'INSERT INTO rests (name, lat, lon, boxes) VALUES ($1, $2, $3, $4)',
+                p[1], float(p[2]), float(p[3]), 5
+            )
+        # --- КОНЕЦ ЛОГИКИ БД ---
         await message.answer(f"✅ Ресторан {p[1]} добавлен (5 наборов)!")
     except Exception:
         await message.answer("Ошибка! Формат: /add Название 41.31 69.27")
 
-# --- НОВЫЕ ФУНКЦИИ АДМИНИСТРАТОРА ---
+# --- НОВЫЕ ФУНКЦИИ АДМИНИСТРАТОРА (POSTGRESQL) ---
 
 @dp.message(Command("admin"))
 async def admin_panel(message: types.Message):
@@ -169,9 +208,10 @@ async def admin_panel(message: types.Message):
         await message.answer("Access denied.")
         return
 
-    async with aiosqlite.connect('uvol_bolmasin.db') as db:
-        async with db.execute('SELECT id, name, boxes FROM rests ORDER BY id') as cursor:
-            rests = await cursor.fetchall()
+    # --- ЛОГИКА БД (asyncpg) ---
+    async with db_pool.acquire() as conn:
+        rests = await conn.fetch('SELECT id, name, boxes FROM rests ORDER BY id')
+    # --- КОНЕЦ ЛОГИКИ БД ---
     
     if not rests:
         await message.answer("Нет добавленных ресторанов в базе данных.")
@@ -203,13 +243,13 @@ async def handle_admin_action(callback: types.CallbackQuery):
     rest_id = int(parts[3])
     
     if action == 'add':
-        async with aiosqlite.connect('uvol_bolmasin.db') as db:
-            # Обновление и получение нового количества
-            await db.execute('UPDATE rests SET boxes = boxes + ? WHERE id = ?', (amount, rest_id))
-            await db.commit()
-            
-            async with db.execute('SELECT name, boxes FROM rests WHERE id = ?', (rest_id,)) as cursor:
-                res = await cursor.fetchone()
+        # --- ЛОГИКА БД (asyncpg) ---
+        async with db_pool.acquire() as conn:
+            res = await conn.fetchrow(
+                'UPDATE rests SET boxes = boxes + $1 WHERE id = $2 RETURNING name, boxes',
+                amount, rest_id
+            )
+        # --- КОНЕЦ ЛОГИКИ БД ---
         
         if res:
             name, new_boxes = res
@@ -227,9 +267,9 @@ async def handle_admin_action(callback: types.CallbackQuery):
 
 # --- ЗАПУСК ---
 async def main():
-    await init_db()
+    await init_db_pool() # Изменено на init_db_pool()
     
-    # !!! НОВОЕ: Сбросить Webhook перед запуском Polling !!!
+    # Гарантированный сброс Webhook для стабильного Polling
     await bot.delete_webhook(drop_pending_updates=True) 
     
     # Запускаем бота и веб-сервер одновременно
@@ -237,6 +277,7 @@ async def main():
         dp.start_polling(bot),
         start_http_server()
     )
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
