@@ -21,11 +21,8 @@ from geopy.distance import geodesic
 
 # --- ИМПОРТ ВАШЕГО МОДУЛЯ GOOGLE SHEETS ---
 # Файл sheets.py должен лежать рядом с main.py
-try:
-    from sheets import GoogleSheetsManager
-except ImportError:
-    logging.warning("⚠️ Файл sheets.py не найден! Запись в Google Таблицы работать не будет.")
-    GoogleSheetsManager = None
+# Ставим заглушку принудительно
+GoogleSheetsManager = None
 
 # Установка уровня логирования
 logging.basicConfig(level=logging.INFO)
