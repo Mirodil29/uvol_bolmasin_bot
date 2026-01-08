@@ -29,7 +29,6 @@ class Config:
     PORT = int(os.getenv("PORT", 8080))
     DATABASE_URL = os.getenv('DATABASE_URL')
     ADMIN_ID = 1031055597 
-    # ССЫЛКА В КАТЫЧКАХ - ЭТО ВАЖНО
     SHEET_LINK = "https://docs.google.com/spreadsheets/d/15WbaWB9Hjq7ypEMeCvJ1_FyX__b0U3MWbt8boWom5B8/edit?usp=sharing"
 
 # --- 2. БАЗА ДАННЫХ ---
@@ -41,7 +40,6 @@ class Database:
         if not url:
             logging.error("DATABASE_URL пуст!")
             return
-        # Отрезаем лишние пробелы, если они есть
         clean_url = url.strip()
         self._pool = await asyncpg.create_pool(clean_url)
         logging.info("PostgreSQL Pool создан.")
@@ -140,21 +138,21 @@ dp = Dispatcher()
 @dp.message(Command("start"))
 async def start(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Xush kelibsiz! «Uvol bo'lmasin»! 😊\nВведите Имя и Фамилию:")
+    await message.answer("Xush kelibsiz! «Uvol bo'lmasin»! 😊\nIsmingizni kiriting:")
     await state.set_state(Reg.name)
 
 @dp.message(Reg.name, F.text)
 async def get_name(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text)
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📱 Номер", request_contact=True)]], resize_keyboard=True)
-    await message.answer("Отправьте номер телефона:", reply_markup=kb)
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📱 Telefon raqan", request_contact=True)]], resize_keyboard=True)
+    await message.answer("Telefon raqam yuborish:", reply_markup=kb)
     await state.set_state(Reg.phone)
 
 @dp.message(Reg.phone, F.contact)
 async def get_phone(message: types.Message, state: FSMContext):
     await state.update_data(phone=message.contact.phone_number)
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📍 Локация", request_location=True)]], resize_keyboard=True)
-    await message.answer("Отправьте геолокацию:", reply_markup=kb)
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📍 Joykashuv", request_location=True)]], resize_keyboard=True)
+    await message.answer("Joylashuvni yuborish:", reply_markup=kb)
     await state.set_state(Reg.location)
 
 @dp.message(Reg.location, F.location)
@@ -165,12 +163,16 @@ async def get_loc(message: types.Message, state: FSMContext, db: Database, gs: A
     # Сохранение в БД
     await db.create_or_update_user(message.from_user.id, data['name'], data['phone'], lat, lon)
     
-    # Сохранение в Google Таблицы
+    # Сохранение в Google Таблицы (Исправлено: добавлено имя пользователя)
     if gs:
+        username = message.from_user.username or "NoUsername"
         asyncio.create_task(gs.add_user(
             user_id=message.from_user.id,
-            username=message.from_user.username,
-            name=data['name'], phone=data['phone'], lat=lat, lon=lon
+            username=username,
+            name=data['name'], 
+            phone=data['phone'], 
+            lat=lat, 
+            lon=lon
         ))
         
     await message.answer("✅ Готово!", reply_markup=ReplyKeyboardRemove())
@@ -247,9 +249,11 @@ async def start_http_server():
     app.router.add_get("/", handle_hc)
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", Config.PORT).start()
+    # Исправлено: запуск сервера теперь не блокирует основной поток
+    site = web.TCPSite(runner, "0.0.0.0", Config.PORT)
+    await site.start()
 
-# --- 7. ТОТ САМЫЙ БЛОК ЗАПУСКА (ВСТАВЛЯТЬ В КОНЕЦ) ---
+# --- 7. БЛОК ЗАПУСКА ---
 async def main():
     bot = Bot(token=Config.API_TOKEN)
     db = Database()
@@ -274,17 +278,17 @@ async def main():
 
     try:
         logging.info("🚀 Бот запускается...")
-        await asyncio.gather(
-            dp.start_polling(bot, db=db, gs=gs),
-            start_http_server()
-        )
+        # Сначала запускаем HTTP сервер
+        await start_http_server()
+        # Затем запускаем поллинг
+        await dp.start_polling(bot, db=db, gs=gs)
     finally:
         await db.close_pool()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Бот остановлен.")
     except Exception as e:
-        logging.critical(f"Ошибка: {e}")
+        logging.critical(f"Ошибка при запуске: {e}")
