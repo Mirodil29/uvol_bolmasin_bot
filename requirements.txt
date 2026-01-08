@@ -1,5 +1,6 @@
-aiogram
-geopy
+aiogram>=3.0.0
 asyncpg
+geopy
 aiohttp
-pip install gspread-asyncio google-auth
+gspread
+oauth2client
