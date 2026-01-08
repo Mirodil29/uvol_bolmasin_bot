@@ -2,3 +2,4 @@ aiogram
 geopy
 asyncpg
 aiohttp
+pip install gspread-asyncio google-auth
