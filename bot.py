@@ -46,8 +46,13 @@ class Database:
             logging.info("PostgreSQL Pool закрыт.")
 
     async def _ensure_tables_exist(self):
-        """Создание таблиц users и rests, если они не существуют."""
+        """
+        Создает таблицы users и rests, если они не существуют.
+        КРИТИЧНО: Проверяет и добавляет необходимые колонки в 'rests',
+        если они были пропущены в предыдущих версиях.
+        """
         async with self._pool.acquire() as conn:
+            # 1. Обеспечиваем наличие таблицы users
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     id BIGINT PRIMARY KEY,
@@ -57,16 +62,43 @@ class Database:
                     lon REAL
                 )
             ''')
+            
+            # 2. Обеспечиваем наличие базовой таблицы rests (если она еще не была создана)
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS rests (
                     id SERIAL PRIMARY KEY,
-                    name TEXT,
-                    lat REAL,
-                    lon REAL,
-                    boxes INTEGER DEFAULT 5
+                    name TEXT
                 )
             ''')
-        logging.info("Database tables проверены/созданы.")
+            
+            # 3. Проверка и добавление недостающих колонок в rests (Schema Migration)
+            
+            # Вспомогательная функция для проверки наличия колонки
+            async def column_exists(table_name, column_name):
+                query = """
+                SELECT 1 
+                FROM information_schema.columns 
+                WHERE table_name=$1 AND column_name=$2
+                """
+                return await conn.fetchval(query, table_name, column_name)
+            
+            # Проверка и добавление 'lat'
+            if not await column_exists('rests', 'lat'):
+                await conn.execute('ALTER TABLE rests ADD COLUMN lat REAL')
+                logging.warning("Колонка 'lat' добавлена в таблицу rests.")
+                
+            # Проверка и добавление 'lon'
+            if not await column_exists('rests', 'lon'):
+                await conn.execute('ALTER TABLE rests ADD COLUMN lon REAL')
+                logging.warning("Колонка 'lon' добавлена в таблицу rests.")
+                
+            # Проверка и добавление 'boxes'
+            if not await column_exists('rests', 'boxes'):
+                # Добавляем с DEFAULT 5, чтобы не сломать существующие строки
+                await conn.execute('ALTER TABLE rests ADD COLUMN boxes INTEGER DEFAULT 5')
+                logging.warning("Колонка 'boxes' добавлена в таблицу rests.")
+
+        logging.info("Database tables проверены, и схема обновлена.")
 
     # --- CRUD: USERS ---
     async def create_or_update_user(self, user_id, name, phone, lat, lon):
@@ -144,15 +176,12 @@ class AdminAccessMiddleware(BaseMiddleware):
         
         user_id = event.from_user.id
         
-        # Проверяем, связано ли событие с админ-функциями
         is_admin_command = (isinstance(event, types.Message) and event.text == '/admin')
         is_admin_callback = (isinstance(event, types.CallbackQuery) and event.data.startswith('admin_'))
 
-        # Если пользователь - админ ИЛИ событие НЕ админское, пропускаем
         if user_id == self.admin_id or not (is_admin_command or is_admin_callback):
             return await handler(event, data)
         else:
-            # Блокируем не-администратора, если он пытается использовать админ-функции
             if isinstance(event, types.Message):
                 await event.answer("Access denied.")
             elif isinstance(event, types.CallbackQuery):
@@ -168,7 +197,9 @@ async def on_startup(dispatcher: Dispatcher, db: Database):
         logging.info("Система готова. База данных подключена и передана в контекст.")
     except Exception as e:
         logging.critical(f"Критическая ошибка инициализации БД: {e}")
-        await dispatcher.stop_polling()
+        # Если здесь ошибка, бот, возможно, не сможет работать, но продолжит работу для health check.
+        # await dispatcher.stop_polling() # Оставляем закомментированным для хостинга
+        
 
 async def on_shutdown(dispatcher: Dispatcher, db: Database):
     """Выполняется при остановке бота."""
@@ -177,7 +208,6 @@ async def on_shutdown(dispatcher: Dispatcher, db: Database):
 
 # --- 6. ОБРАБОТЧИКИ: ЛОГИКА ПОЛЬЗОВАТЕЛЯ (User Flow) ---
 
-# Диспетчер будет инициализирован в main()
 dp = Dispatcher() 
 
 @dp.message(Command("start"))
@@ -198,6 +228,11 @@ async def get_name(message: types.Message, state: FSMContext):
     await message.answer("Отправьте номер телефона кнопкой ниже:", reply_markup=kb)
     await state.set_state(Reg.phone)
 
+@dp.message(Reg.name)
+async def invalid_input_name_non_text(message: types.Message):
+    """Перехват нетекстового ввода в состоянии ожидания имени."""
+    await message.answer("❌ Ожидался ввод имени (текст). Пожалуйста, введите ваше имя.")
+
 @dp.message(Reg.phone, F.contact)
 async def get_phone(message: types.Message, state: FSMContext):
     """Шаг 3: Получение телефона (контакт) и запрос локации."""
@@ -208,6 +243,11 @@ async def get_phone(message: types.Message, state: FSMContext):
     )
     await message.answer("Отправьте геолокацию, чтобы найти еду рядом:", reply_markup=kb)
     await state.set_state(Reg.location)
+
+@dp.message(Reg.phone)
+async def invalid_input_phone_non_contact(message: types.Message):
+    """Перехват неконтактного ввода в состоянии ожидания телефона."""
+    await message.answer("❌ Ожидалась отправка номера телефона через специальную кнопку.")
 
 @dp.message(Reg.location, F.location)
 async def get_loc(message: types.Message, state: FSMContext, db: Database):
@@ -226,12 +266,19 @@ async def get_loc(message: types.Message, state: FSMContext, db: Database):
     await state.clear()
     await show_restaurants(message, lat, lon, db)
 
+@dp.message(Reg.location)
+async def invalid_input_location_non_location(message: types.Message):
+    """Перехват негеолокационного ввода в состоянии ожидания локации."""
+    await message.answer("❌ Ожидалась отправка геолокации через специальную кнопку.")
+
+
 async def show_restaurants(message, u_lat, u_lon, db: Database):
     """Поиск и отображение ближайших активных ресторанов."""
     try:
         rests = await db.get_active_rests()
     except Exception as e:
-        logging.error(f"DB Error (Get rests): {e}")
+        # Теперь эта ошибка должна быть менее вероятной из-за проверки схемы
+        logging.error(f"DB Error (Get rests): {e}") 
         await message.answer("❌ Ошибка при загрузке данных о ресторанах.")
         return
 
@@ -295,7 +342,8 @@ async def send_admin_panel(message: types.Message, db: Database, text: str = Non
     try:
         rests = await db.get_all_rests()
     except Exception as e:
-        logging.error(f"DB Error (Get all rests): {e}")
+        # Теперь эта ошибка должна быть менее вероятной из-за проверки схемы
+        logging.error(f"DB Error (Get all rests): {e}") 
         await message.answer("❌ Ошибка при загрузке списка ресторанов.")
         return
     
@@ -314,7 +362,7 @@ async def send_admin_panel(message: types.Message, db: Database, text: str = Non
 
 @dp.message(Command("admin"))
 async def admin_panel(message: types.Message, state: FSMContext, db: Database):
-    """Шаг 1: Главный вход в админ-панель."""
+    """Главный вход в админ-панель."""
     await state.clear() 
     await send_admin_panel(message, db)
 
@@ -322,7 +370,7 @@ async def admin_panel(message: types.Message, state: FSMContext, db: Database):
 
 @dp.callback_query(F.data == "admin_add_new")
 async def admin_start_add_new(callback: types.CallbackQuery, state: FSMContext):
-    """Шаг 2: Начало добавления ресторана. Запрос названия."""
+    """Начало добавления ресторана. Запрос названия."""
     await state.clear()
     await callback.message.edit_text(
         "📝 **ДОБАВЛЕНИЕ РЕСТОРАНА**\n\nВведите **Название** нового ресторана:",
@@ -334,9 +382,9 @@ async def admin_start_add_new(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.adding_rest_name)
     await callback.answer()
 
-@dp.message(AdminStates.adding_rest_name, F.text) # <<< СТРОГАЯ ФИЛЬТРАЦИЯ
+@dp.message(AdminStates.adding_rest_name, F.text) # СТРОГАЯ ФИЛЬТРАЦИЯ
 async def admin_get_rest_name(message: types.Message, state: FSMContext):
-    """Шаг 3: Получение названия (ТОЛЬКО ТЕКСТ) и запрос локации."""
+    """Получение названия (ТОЛЬКО ТЕКСТ) и запрос локации."""
     name = message.text.strip()
     if not name or len(name) < 2 or len(name) > 50:
         await message.answer("❌ Название должно быть от 2 до 50 символов. Попробуйте снова.")
@@ -354,14 +402,14 @@ async def admin_get_rest_name(message: types.Message, state: FSMContext):
     )
     await state.set_state(AdminStates.adding_rest_location)
 
-@dp.message(AdminStates.adding_rest_name) # <<< Обработчик для НЕ-ТЕКСТА (контакты, локации и т.д.)
+@dp.message(AdminStates.adding_rest_name) # Обработчик для НЕ-ТЕКСТА
 async def admin_invalid_input_name(message: types.Message):
     """Перехват неверного ввода в состоянии ожидания названия."""
     await message.answer("❌ Ожидался ввод текстового названия ресторана. Пожалуйста, введите текст.")
 
 @dp.message(AdminStates.adding_rest_location, F.location)
 async def admin_get_rest_location(message: types.Message, state: FSMContext, db: Database):
-    """Шаг 4: Получает локацию (ТОЛЬКО ЛОКАЦИЯ), сохраняет в БД и завершает FSM."""
+    """Получает локацию (ТОЛЬКО ЛОКАЦИЯ), сохраняет в БД и завершает FSM."""
     data = await state.get_data()
     name = data.get('new_rest_name')
     lat, lon = message.location.latitude, message.location.longitude
@@ -432,7 +480,7 @@ async def admin_select_rest(callback: types.CallbackQuery, state: FSMContext, db
 
 @dp.callback_query(F.data == "admin_set_qty")
 async def admin_start_set_quantity(callback: types.CallbackQuery, state: FSMContext):
-    """Шаг 5: Начало установки нового количества."""
+    """Начало установки нового количества."""
     data = await state.get_data()
     name = data.get('current_rest_name')
     
@@ -453,9 +501,9 @@ async def admin_start_set_quantity(callback: types.CallbackQuery, state: FSMCont
     await callback.answer()
 
 
-@dp.message(AdminStates.waiting_for_new_quantity, F.text) # <<< СТРОГАЯ ФИЛЬТРАЦИЯ
+@dp.message(AdminStates.waiting_for_new_quantity, F.text) # СТРОГАЯ ФИЛЬТРАЦИЯ
 async def admin_finish_set_quantity(message: types.Message, state: FSMContext, db: Database):
-    """Шаг 6: Обрабатывает введенное число (ТОЛЬКО ТЕКСТ) и обновляет БД."""
+    """Обрабатывает введенное число (ТОЛЬКО ТЕКСТ) и обновляет БД."""
     data = await state.get_data()
     rest_id = data.get('current_rest_id')
     
@@ -574,7 +622,7 @@ async def admin_back_to_menu(callback: types.CallbackQuery, state: FSMContext, d
 
 @dp.callback_query(F.data == "admin_cancel_fsm")
 async def admin_cancel_fsm(callback: types.CallbackQuery, state: FSMContext, db: Database):
-    """Шаг 7: Отмена любого FSM состояния администратора."""
+    """Отмена любого FSM состояния администратора."""
     await state.clear()
     await callback.message.edit_text("Операция отменена. Возврат в главное меню.")
     await send_admin_panel(callback.message, db, text="Операция отменена. Возврат в главное меню.")
@@ -639,13 +687,11 @@ async def main():
     dp.callback_query.middleware(AdminAccessMiddleware(Config.ADMIN_ID))
 
     # 2. Регистрация хуков для Graceful Shutdown
-    # Передаем db_instance в хуки через lambda
     dp.startup.register(lambda: on_startup(dp, db_instance))
     dp.shutdown.register(lambda: on_shutdown(dp, db_instance))
 
     # 3. Запуск бота и веб-сервера
     await asyncio.gather(
-        # Передаем db_instance как аргумент в start_polling для DI
         dp.start_polling(bot, db=db_instance), 
         start_http_server()
     )
