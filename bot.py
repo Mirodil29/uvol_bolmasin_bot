@@ -10,7 +10,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from geopy.distance import geodesic
 
 # --- НАСТРОЙКИ ---
@@ -25,18 +25,30 @@ db_pool: asyncpg.Pool = None
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
-dp = Dispatcher()
+# Диспетчер теперь будет автоматически использовать MemoryStorage для FSM
+dp = Dispatcher() 
 
+# --- FSM СОСТОЯНИЯ: ПОЛЬЗОВАТЕЛИ ---
 class Reg(StatesGroup):
     name = State()
     phone = State()
     location = State()
 
+# --- FSM СОСТОЯНИЯ: АДМИН ПАНЕЛЬ (НОВЫЕ СОСТОЯНИЯ) ---
+class AdminStates(StatesGroup):
+    """Состояния для администрирования ресторанов"""
+    # Состояние ожидания ввода нового количества для ресторана
+    waiting_for_new_quantity = State()
+    # Состояние ожидания ввода данных для нового ресторана
+    waiting_for_new_rest_data = State() 
+
 # --- БАЗА ДАННЫХ (POSTGRESQL) ---
 async def init_db_pool():
     global db_pool
-    # Проверка переменной окружения опущена для краткости
-        
+    if not DATABASE_URL:
+        logging.error("DATABASE_URL не установлен!")
+        return
+
     db_pool = await asyncpg.create_pool(DATABASE_URL)
     logging.info("PostgreSQL Pool создан.")
 
@@ -75,9 +87,12 @@ async def start_http_server():
     await site.start()
     logging.info(f"Health check server started on port {PORT}")
 
-# --- ЛОГИКА БОТА ---
+# --- ЛОГИКА БОТА: РЕГИСТРАЦИЯ И БРОНИРОВАНИЕ (ОСТАВЛЕНО БЕЗ ИЗМЕНЕНИЙ) ---
+
 @dp.message(Command("start"))
 async def start(message: types.Message, state: FSMContext):
+    # Добавляем сброс состояния на случай, если пользователь завис
+    await state.clear()
     await message.answer("Xush kelibsiz! «Uvol bo'lmasin»! 😊\nВведите Имя и Фамилию:")
     await state.set_state(Reg.name)
 
@@ -114,7 +129,8 @@ async def get_loc(message: types.Message, state: FSMContext):
         )
     # --- КОНЕЦ ЛОГИКИ БД ---
     
-    await message.answer("✅ Регистрация завершена!", reply_markup=types.ReplyKeyboardRemove())
+    await message.answer("✅ Регистрация завершена!", reply_markup=ReplyKeyboardRemove())
+    await state.clear()
     await show_restaurants(message, lat, lon)
 
 async def show_restaurants(message, u_lat, u_lon):
@@ -129,10 +145,8 @@ async def show_restaurants(message, u_lat, u_lon):
 
     nearby = []
     for r in rests:
-        # r[1] = lat, r[2] = lon
         dist = geodesic((u_lat, u_lon), (r[1], r[2])).km
         if dist < 10: # Показываем в радиусе 10км
-            # r[0]=name, r[3]=boxes, r[4]=id
             nearby.append((r[0], dist, r[3], r[4]))
     
     nearby.sort(key=lambda x: x[1])
@@ -175,89 +189,194 @@ async def handle_booking(callback: types.CallbackQuery):
         await callback.answer("Увы, наборы в этом заведении уже закончились!", show_alert=True)
         await callback.message.delete()
 
+
 @dp.message(Command("add"))
-async def add_rest(message: types.Message):
+async def add_rest_old(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("Access denied.")
         return
+    # Эта команда устарела, так как мы будем использовать FSM для добавления
+    await message.answer("⚠️ Команда /add устарела. Используйте /admin и подменю 'Добавить Ресторан'.")
 
-    try:
-        p = message.text.split(maxsplit=3)
-        # /add Name Lat Lon
-        # --- ЛОГИКА БД (asyncpg) ---
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                'INSERT INTO rests (name, lat, lon, boxes) VALUES ($1, $2, $3, $4)',
-                p[1], float(p[2]), float(p[3]), 5
-            )
-        # --- КОНЕЦ ЛОГИКИ БД ---
-        await message.answer(f"✅ Ресторан {p[1]} добавлен (5 наборов)!")
-    except Exception:
-        await message.answer("Ошибка! Формат: /add Название 41.31 69.27")
+# --- НОВЫЕ ФУНКЦИИ АДМИНИСТРАТОРА (FSM + POSTGRESQL) ---
 
-# --- НОВЫЕ ФУНКЦИИ АДМИНИСТРАТОРА (POSTGRESQL) ---
+def get_admin_main_keyboard(rests):
+    """Генерирует клавиатуру с ресторанами для управления"""
+    buttons = []
+    for r in rests:
+        rest_id, name, boxes = r
+        # Новый callback для выбора ресторана, например: admin_select:123
+        buttons.append([InlineKeyboardButton(text=f"📍 {name} (Наборов: {boxes})", callback_data=f"admin_select_{rest_id}")])
+    
+    # Кнопка для добавления нового ресторана
+    buttons.append([InlineKeyboardButton(text="➕ Добавить Новый Ресторан", callback_data="admin_add_new")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def send_admin_panel(message: types.Message, text: str = None):
+    """Отправляет или редактирует главное меню админ-панели"""
+    async with db_pool.acquire() as conn:
+        rests = await conn.fetch('SELECT id, name, boxes FROM rests ORDER BY name')
+    
+    text = text if text else "⚙️ **Панель Управления Ресторанами** ⚙️\nВыберите ресторан для управления:"
+    
+    await message.answer(text, reply_markup=get_admin_main_keyboard(rests), parse_mode="Markdown")
+
 
 @dp.message(Command("admin"))
-async def admin_panel(message: types.Message):
+async def admin_panel(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         await message.answer("Access denied.")
+        return
+    
+    # Сброс любого предыдущего FSM состояния администратора перед показом меню
+    await state.clear() 
+    await send_admin_panel(message)
+
+
+@dp.callback_query(F.data.startswith("admin_select_"))
+async def admin_select_rest(callback: types.CallbackQuery, state: FSMContext):
+    """Показывает подменю управления выбранным рестораном"""
+    rest_id = int(callback.data.split("_")[-1])
+    
+    async with db_pool.acquire() as conn:
+        rest = await conn.fetchrow('SELECT name, boxes FROM rests WHERE id = $1', rest_id)
+    
+    if not rest:
+        await callback.answer("Ресторан не найден.", show_alert=True)
+        return
+    
+    name, boxes = rest
+    
+    # Сохраняем ID ресторана в FSM Context для дальнейших действий
+    await state.update_data(current_rest_id=rest_id)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎯 Установить Количество", callback_data="admin_set_qty")],
+        [InlineKeyboardButton(text="➕ Добавить +5 наборов (Быстро)", callback_data=f"admin_add_5_{rest_id}")],
+        [InlineKeyboardButton(text="🗑️ Удалить Ресторан", callback_data=f"admin_delete_{rest_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад к списку", callback_data="admin_back")]
+    ])
+    
+    await callback.message.edit_text(
+        f"🛠️ **Управление: {name}**\n\nТекущий остаток: **{boxes}** наборов.",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_set_qty")
+async def admin_start_set_quantity(callback: types.CallbackQuery, state: FSMContext):
+    """Начинает процесс установки количества (переводит в FSM)"""
+    data = await state.get_data()
+    rest_id = data.get('current_rest_id')
+    
+    async with db_pool.acquire() as conn:
+        name = await conn.fetchval('SELECT name FROM rests WHERE id = $1', rest_id)
+    
+    if not rest_id or not name:
+        await callback.answer("Ошибка FSM. Вернитесь в главное меню.", show_alert=True)
+        await send_admin_panel(callback.message)
+        return
+    
+    await callback.message.edit_text(
+        f"**Введите НОВОЕ общее количество наборов для ресторана {name}.**\n\n(Только целое число, например: **30**)",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel_fsm")]
+        ]),
+        parse_mode="Markdown"
+    )
+    # !!! КЛЮЧЕВОЙ ШАГ: ПЕРЕВОД В СОСТОЯНИЕ FSM !!!
+    await state.set_state(AdminStates.waiting_for_new_quantity)
+    await callback.answer()
+
+
+@dp.message(AdminStates.waiting_for_new_quantity)
+async def admin_finish_set_quantity(message: types.Message, state: FSMContext):
+    """Обрабатывает введенное число и обновляет БД"""
+    try:
+        new_qty = int(message.text)
+        if new_qty < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Неверный ввод. Пожалуйста, введите **целое положительное число**.")
+        return
+        
+    data = await state.get_data()
+    rest_id = data.get('current_rest_id')
+    
+    if not rest_id:
+        await message.answer("❌ Ошибка: Ресторан не выбран. Начните с /admin.")
+        await state.clear()
         return
 
     # --- ЛОГИКА БД (asyncpg) ---
     async with db_pool.acquire() as conn:
-        rests = await conn.fetch('SELECT id, name, boxes FROM rests ORDER BY id')
+        res = await conn.fetchrow(
+            'UPDATE rests SET boxes = $1 WHERE id = $2 RETURNING name, boxes',
+            new_qty, rest_id
+        )
     # --- КОНЕЦ ЛОГИКИ БД ---
     
-    if not rests:
-        await message.answer("Нет добавленных ресторанов в базе данных.")
-        return
-
-    text = "⚙️ **Панель Управления Ресторанами** ⚙️\n\n"
-    buttons = []
+    await state.clear() # Сбрасываем FSM состояние!
     
-    for r in rests:
-        rest_id, name, boxes = r
-        text += f"📍 **{name}** | Наборов: **{boxes}** | ID: {rest_id}\n"
+    if res:
+        name, boxes = res
+        await message.answer(
+            f"✅ **Успешно обновлено!**\n\n"
+            f"Ресторан: **{name}**\n"
+            f"Установлено: **{boxes}** наборов.",
+            parse_mode="Markdown"
+        )
+    else:
+        await message.answer("❌ Ошибка обновления. Ресторан не найден.")
+    
+    # Возвращаем в основное меню админа
+    await send_admin_panel(message)
+
+
+# --- ОБРАБОТЧИКИ НАВИГАЦИИ И ДЕЙСТВИЙ ---
+
+@dp.callback_query(F.data == "admin_back")
+async def admin_back_to_menu(callback: types.CallbackQuery, state: FSMContext):
+    """Возвращает из подменю в главное меню админа"""
+    await state.clear()
+    await callback.message.delete()
+    await send_admin_panel(callback.message)
+
+
+@dp.callback_query(F.data == "admin_cancel_fsm")
+async def admin_cancel_fsm(callback: types.CallbackQuery, state: FSMContext):
+    """Отмена FSM состояния"""
+    await state.clear()
+    await callback.message.delete()
+    await send_admin_panel(callback.message, text="Операция отменена. Возврат в главное меню.")
+
+
+@dp.callback_query(F.data.startswith("admin_add_5_"))
+async def handle_admin_add_5(callback: types.CallbackQuery):
+    """Оставлена логика быстрого добавления +5"""
+    rest_id = int(callback.data.split("_")[-1])
+    
+    # --- ЛОГИКА БД (asyncpg) ---
+    async with db_pool.acquire() as conn:
+        res = await conn.fetchrow(
+            'UPDATE rests SET boxes = boxes + 5 WHERE id = $1 RETURNING name, boxes',
+            rest_id
+        )
+    # --- КОНЕЦ ЛОГИКИ БД ---
         
-        buttons.append([
-            InlineKeyboardButton(text=f"➕ Добавить 5 наборов в {name}", callback_data=f"admin_add_5_{rest_id}")
-        ])
-
-    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-
-@dp.callback_query(F.data.startswith("admin_"))
-async def handle_admin_action(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("У вас нет прав администратора.", show_alert=True)
-        return
+    if res:
+        name, new_boxes = res
+        await callback.message.edit_text(
+            f"✅ Наборы обновлены!\n📍 Ресторан: **{name}**\nНовое кол-во наборов: **{new_boxes}**",
+            reply_markup=get_admin_main_keyboard([ (rest_id, name, new_boxes) ]), # Обновляем кнопку для текущего ресторана
+            parse_mode="Markdown"
+        )
+    else:
+        await callback.answer("Ошибка: Ресторан не найден.", show_alert=True)
     
-    parts = callback.data.split("_")
-    action = parts[1]
-    amount = int(parts[2])
-    rest_id = int(parts[3])
-    
-    if action == 'add':
-        # --- ЛОГИКА БД (asyncpg) ---
-        async with db_pool.acquire() as conn:
-            res = await conn.fetchrow(
-                'UPDATE rests SET boxes = boxes + $1 WHERE id = $2 RETURNING name, boxes',
-                amount, rest_id
-            )
-        # --- КОНЕЦ ЛОГИКИ БД ---
-        
-        if res:
-            name, new_boxes = res
-            
-            await callback.message.edit_text(
-                f"✅ Наборы обновлены!\n"
-                f"📍 Ресторан: **{name}**\n"
-                f"Новое кол-во наборов: **{new_boxes}**",
-                reply_markup=callback.message.reply_markup
-            )
-        else:
-             await callback.answer("Ошибка: Ресторан не найден.", show_alert=True)
-            
     await callback.answer()
 
 # --- ЗАПУСК ---
@@ -269,11 +388,12 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True) 
     
     # 3. Запускаем бота и веб-сервер одновременно
+    # Используем asyncio.gather для одновременного запуска
     await asyncio.gather(
         dp.start_polling(bot),
         start_http_server()
     )
-# ... (остальной код main) ...
+    
 if __name__ == "__main__":
     try:
         asyncio.run(main())
