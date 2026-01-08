@@ -13,15 +13,20 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from geopy.distance import geodesic
 
+# Установка уровня логирования
+logging.basicConfig(level=logging.INFO)
+
 # --- 1. АРХИТЕКТУРНЫЙ СЛОЙ: КОНФИГУРАЦИЯ ---
 class Config:
     """Класс для централизованного управления конфигурацией."""
     API_TOKEN = os.getenv('BOT_TOKEN')
     PORT = int(os.getenv("PORT", 8080))
-    DATABASE_URL = os.getenv('DATABASE_URL') # Переменная для Neon/Postgres
-    ADMIN_ID = 1031055597 # Замените на реальный ID администратора
+    DATABASE_URL = os.getenv('DATABASE_URL')
+    # ВАЖНО: Замените на реальный ID администратора
+    ADMIN_ID = 1031055597 
 
 # --- 2. АРХИТЕКТУРНЫЙ СЛОЙ: DAO (Data Access Object) ---
+# (Логика класса Database остается неизменной, так как она уже чиста)
 class Database:
     """Класс для инкапсуляции всех операций с базой данных (PostgreSQL)."""
     def __init__(self):
@@ -35,10 +40,15 @@ class Database:
         logging.info("PostgreSQL Pool создан.")
         await self._ensure_tables_exist()
 
+    async def close_pool(self):
+        """Корректное закрытие пула при завершении работы."""
+        if self._pool:
+            await self._pool.close()
+            logging.info("PostgreSQL Pool закрыт.")
+
     async def _ensure_tables_exist(self):
         """Создание таблиц users и rests, если они не существуют."""
         async with self._pool.acquire() as conn:
-            # Таблица пользователей
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     id BIGINT PRIMARY KEY,
@@ -48,7 +58,6 @@ class Database:
                     lon REAL
                 )
             ''')
-            # Таблица ресторанов (rests)
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS rests (
                     id SERIAL PRIMARY KEY,
@@ -62,7 +71,6 @@ class Database:
 
     # --- CRUD: ПОЛЬЗОВАТЕЛИ ---
     async def create_or_update_user(self, user_id, name, phone, lat, lon):
-        """Сохраняет или обновляет данные пользователя при регистрации."""
         await self._pool.execute(
             'INSERT INTO users (id, name, phone, lat, lon) VALUES ($1, $2, $3, $4, $5) '
             'ON CONFLICT (id) DO UPDATE SET name=$2, phone=$3, lat=$4, lon=$5',
@@ -71,14 +79,9 @@ class Database:
 
     # --- CRUD: РЕСТОРАНЫ (для Пользователя) ---
     async def get_active_rests(self):
-        """Возвращает все рестораны, у которых есть доступные наборы."""
         return await self._pool.fetch('SELECT name, lat, lon, boxes, id FROM rests WHERE boxes > 0')
 
     async def decrement_boxes_atomic(self, rest_id):
-        """
-        Атомарное уменьшение количества наборов и возврат имени/нового количества.
-        Это критически важно для предотвращения одновременного бронирования.
-        """
         return await self._pool.fetchrow(
             'UPDATE rests SET boxes = boxes - 1 WHERE id = $1 AND boxes > 0 RETURNING name, boxes',
             rest_id
@@ -86,80 +89,67 @@ class Database:
 
     # --- CRUD: РЕСТОРАНЫ (для Администратора) ---
     async def get_all_rests(self):
-        """Возвращает все рестораны для админ-панели."""
         return await self._pool.fetch('SELECT id, name, boxes FROM rests ORDER BY name')
 
     async def get_rest_details(self, rest_id):
-        """Возвращает имя и количество наборов для одного ресторана."""
         return await self._pool.fetchrow('SELECT name, boxes FROM rests WHERE id = $1', rest_id)
 
     async def set_boxes_quantity(self, rest_id, quantity):
-        """Устанавливает новое общее количество наборов."""
         return await self._pool.fetchrow(
             'UPDATE rests SET boxes = $1 WHERE id = $2 RETURNING name, boxes',
             quantity, rest_id
         )
 
     async def increment_boxes(self, rest_id, delta):
-        """Увеличивает количество наборов на заданное значение (для быстрого добавления)."""
         return await self._pool.fetchrow(
             'UPDATE rests SET boxes = boxes + $1 WHERE id = $2 RETURNING name, boxes',
             delta, rest_id
         )
 
     async def insert_new_rest(self, name, lat, lon, initial_boxes=5):
-        """Добавляет новый ресторан."""
         await self._pool.execute(
             'INSERT INTO rests (name, lat, lon, boxes) VALUES ($1, $2, $3, $4)',
             name, lat, lon, initial_boxes
         )
-    
+
     async def delete_rest_by_id(self, rest_id):
-        """Удаляет ресторан по ID и возвращает его имя."""
         return await self._pool.fetchval(
             'DELETE FROM rests WHERE id = $1 RETURNING name',
             rest_id
         )
 
-# --- 3. ГЛОБАЛЬНЫЕ НАСТРОЙКИ ---
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=Config.API_TOKEN)
-dp = Dispatcher()
-
-# Глобальный экземпляр DAO (будет инициализирован в main)
-db: Database = None 
-
-# --- 4. FSM СОСТОЯНИЯ: ПОЛЬЗОВАТЕЛИ ---
+# --- 3. FSM СОСТОЯНИЯ ---
 class Reg(StatesGroup):
     name = State()
     phone = State()
     location = State()
 
-# --- 5. FSM СОСТОЯНИЯ: АДМИН ПАНЕЛЬ ---
 class AdminStates(StatesGroup):
-    """Состояния для администрирования ресторанов"""
     waiting_for_new_quantity = State()
     adding_rest_name = State() 
     adding_rest_location = State() 
-    # Новое состояние для подтверждения удаления
     waiting_for_delete_confirm = State() 
 
-# --- 6. HTTP SERVER ДЛЯ RENDER (Health Check) ---
-async def handle_hc(request):
-    """Проверка работоспособности для хостинга (Render)."""
-    return web.Response(text="Bot is running!")
+# --- 4. ХУКИ ЗАПУСКА И ОСТАНОВКИ (Graceful Shutdown) ---
 
-async def start_http_server():
-    """Запуск небольшого HTTP-сервера для health check."""
-    app = web.Application()
-    app.router.add_get("/", handle_hc)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", Config.PORT)
-    await site.start()
-    logging.info(f"Health check server started on port {Config.PORT}")
+async def on_startup(dispatcher: Dispatcher, db: Database):
+    """Выполняется при запуске бота."""
+    try:
+        await db.init_pool(Config.DATABASE_URL)
+        # Передача DAO объекта в контекст для DI
+        dispatcher["db"] = db 
+        logging.info("Система готова. База данных подключена и передана в контекст.")
+    except Exception as e:
+        logging.critical(f"Критическая ошибка инициализации БД: {e}")
+        # В случае ошибки, завершаем работу бота
+        await dispatcher.stop_polling()
 
-# --- 7. ОБРАБОТЧИКИ: ЛОГИКА ПОЛЬЗОВАТЕЛЯ ---
+async def on_shutdown(dispatcher: Dispatcher, db: Database):
+    """Выполняется при остановке бота."""
+    await db.close_pool()
+    logging.info("Система остановлена. Ресурсы освобождены.")
+
+# --- 5. ОБРАБОТЧИКИ: ЛОГИКА ПОЛЬЗОВАТЕЛЯ (Используем DI) ---
 
 @dp.message(Command("start"))
 async def start(message: types.Message, state: FSMContext):
@@ -191,8 +181,8 @@ async def get_phone(message: types.Message, state: FSMContext):
     await state.set_state(Reg.location)
 
 @dp.message(Reg.location, F.location)
-async def get_loc(message: types.Message, state: FSMContext):
-    """Получение локации, сохранение пользователя и показ ресторанов."""
+async def get_loc(message: types.Message, state: FSMContext, db: Database):
+    """Получение локации, сохранение пользователя и показ ресторанов. (db: Database - DI)"""
     data = await state.get_data()
     lat, lon = message.location.latitude, message.location.longitude
     
@@ -205,9 +195,9 @@ async def get_loc(message: types.Message, state: FSMContext):
     
     await message.answer("✅ Регистрация завершена!", reply_markup=ReplyKeyboardRemove())
     await state.clear()
-    await show_restaurants(message, lat, lon)
+    await show_restaurants(message, lat, lon, db) # Передаем db
 
-async def show_restaurants(message, u_lat, u_lon):
+async def show_restaurants(message, u_lat, u_lon, db: Database):
     """Поиск и отображение ближайших активных ресторанов."""
     try:
         rests = await db.get_active_rests()
@@ -216,6 +206,7 @@ async def show_restaurants(message, u_lat, u_lon):
         await message.answer("❌ Ошибка при загрузке данных о ресторанах.")
         return
 
+    # ... (Остальная логика поиска и форматирования остается прежней) ...
     if not rests:
         await message.answer("К сожалению, сейчас нет активных предложений рядом с вами. 😔")
         return
@@ -240,9 +231,10 @@ async def show_restaurants(message, u_lat, u_lon):
 
     await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
+
 @dp.callback_query(F.data.startswith("book_"))
-async def handle_booking(callback: types.CallbackQuery):
-    """Обработка бронирования с атомарным уменьшением наборов."""
+async def handle_booking(callback: types.CallbackQuery, db: Database):
+    """Обработка бронирования с атомарным уменьшением наборов. (db: Database - DI)"""
     rest_id = int(callback.data.split("_")[1])
     
     try:
@@ -263,22 +255,16 @@ async def handle_booking(callback: types.CallbackQuery):
         )
     else:
         await callback.answer("Увы, наборы в этом заведении уже закончились!", show_alert=True)
-        await callback.message.delete()
+        # Если закончились, удаляем сообщение, чтобы не путать пользователя
+        try:
+             await callback.message.delete()
+        except:
+             pass # Не всегда можно удалить сообщение, если оно уже старое
 
-# --- 8. ОБРАБОТЧИКИ: ЛОГИКА АДМИНИСТРАТОРА (CRUD) ---
+# --- 6. ОБРАБОТЧИКИ: ЛОГИКА АДМИНИСТРАТОРА (CRUD) ---
 
-def get_admin_main_keyboard(rests):
-    """Генерирует клавиатуру с ресторанами для управления."""
-    buttons = []
-    for r in rests:
-        rest_id, name, boxes = r['id'], r['name'], r['boxes']
-        buttons.append([InlineKeyboardButton(text=f"📍 {name} (Наборов: {boxes})", callback_data=f"admin_select_{rest_id}")])
-    
-    buttons.append([InlineKeyboardButton(text="➕ Добавить Новый Ресторан", callback_data="admin_add_new")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-async def send_admin_panel(message: types.Message, text: str = None):
+# Вспомогательная функция, которая теперь тоже принимает db
+async def send_admin_panel(message: types.Message, db: Database, text: str = None):
     """Отправляет или редактирует главное меню админ-панели."""
     try:
         rests = await db.get_all_rests()
@@ -289,24 +275,34 @@ async def send_admin_panel(message: types.Message, text: str = None):
     
     text = text if text else "⚙️ **Панель Управления Ресторанами** ⚙️\nВыберите ресторан для управления:"
     
+    # Функция get_admin_main_keyboard осталась неизменной
+    def get_admin_main_keyboard(rests):
+        buttons = []
+        for r in rests:
+            rest_id, name, boxes = r['id'], r['name'], r['boxes']
+            buttons.append([InlineKeyboardButton(text=f"📍 {name} (Наборов: {boxes})", callback_data=f"admin_select_{rest_id}")])
+        
+        buttons.append([InlineKeyboardButton(text="➕ Добавить Новый Ресторан", callback_data="admin_add_new")])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+    
     await message.answer(text, reply_markup=get_admin_main_keyboard(rests), parse_mode="Markdown")
 
-
 @dp.message(Command("admin"))
-async def admin_panel(message: types.Message, state: FSMContext):
-    """Главный вход в админ-панель."""
+async def admin_panel(message: types.Message, state: FSMContext, db: Database):
+    """Главный вход в админ-панель. (db: Database - DI)"""
     if message.from_user.id != Config.ADMIN_ID:
         await message.answer("Access denied.")
         return
     
     await state.clear() 
-    await send_admin_panel(message)
+    await send_admin_panel(message, db)
+
 
 # --- ДОБАВЛЕНИЕ РЕСТОРАНА ---
 
 @dp.callback_query(F.data == "admin_add_new")
 async def admin_start_add_new(callback: types.CallbackQuery, state: FSMContext):
-    """Шаг 1: Запрашивает название ресторана."""
+    # Логика не требует db, остается прежней
     await state.clear()
     await callback.message.edit_text(
         "📝 **ДОБАВЛЕНИЕ РЕСТОРАНА**\n\nВведите **Название** нового ресторана:",
@@ -320,19 +316,17 @@ async def admin_start_add_new(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(AdminStates.adding_rest_name)
 async def admin_get_rest_name(message: types.Message, state: FSMContext):
-    """Шаг 2: Получает название, запрашивает локацию."""
+    # Логика не требует db, остается прежней
     name = message.text.strip()
     if not name or len(name) < 2 or len(name) > 50:
         await message.answer("❌ Название должно быть от 2 до 50 символов. Попробуйте снова.")
         return
 
     await state.update_data(new_rest_name=name)
-    
     kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📍 Отправить локацию", request_location=True)]], 
         resize_keyboard=True, one_time_keyboard=True
     )
-    
     await message.answer(
         f"✅ Название сохранено: **{name}**\n\nТеперь отправьте **Геолокацию** ресторана (используйте кнопку ниже).",
         reply_markup=kb,
@@ -341,8 +335,8 @@ async def admin_get_rest_name(message: types.Message, state: FSMContext):
     await state.set_state(AdminStates.adding_rest_location)
 
 @dp.message(AdminStates.adding_rest_location, F.location)
-async def admin_get_rest_location(message: types.Message, state: FSMContext):
-    """Шаг 3: Получает локацию, сохраняет в БД и завершает FSM."""
+async def admin_get_rest_location(message: types.Message, state: FSMContext, db: Database):
+    """Шаг 3: Получает локацию, сохраняет в БД и завершает FSM. (db: Database - DI)"""
     data = await state.get_data()
     name = data.get('new_rest_name')
     lat, lon = message.location.latitude, message.location.longitude
@@ -368,14 +362,14 @@ async def admin_get_rest_location(message: types.Message, state: FSMContext):
         await message.answer("❌ Произошла ошибка при сохранении данных в базу.", reply_markup=ReplyKeyboardRemove())
 
     await state.clear()
-    await send_admin_panel(message)
+    await send_admin_panel(message, db) # Передаем db
     
 
 # --- УПРАВЛЕНИЕ КОЛИЧЕСТВОМ И УДАЛЕНИЕ ---
 
 @dp.callback_query(F.data.startswith("admin_select_"))
-async def admin_select_rest(callback: types.CallbackQuery, state: FSMContext):
-    """Показывает подменю управления выбранным рестораном."""
+async def admin_select_rest(callback: types.CallbackQuery, state: FSMContext, db: Database):
+    """Показывает подменю управления выбранным рестораном. (db: Database - DI)"""
     rest_id = int(callback.data.split("_")[-1])
     
     try:
@@ -396,7 +390,7 @@ async def admin_select_rest(callback: types.CallbackQuery, state: FSMContext):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎯 Установить Количество", callback_data="admin_set_qty")],
         [InlineKeyboardButton(text="➕ Добавить +5 наборов (Быстро)", callback_data=f"admin_add_5_{rest_id}")],
-        [InlineKeyboardButton(text="🗑️ Удалить Ресторан", callback_data="admin_delete_start")], # Изменен callback
+        [InlineKeyboardButton(text="🗑️ Удалить Ресторан", callback_data="admin_delete_start")], 
         [InlineKeyboardButton(text="⬅️ Назад к списку", callback_data="admin_back")]
     ])
     
@@ -407,17 +401,18 @@ async def admin_select_rest(callback: types.CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-# --- НАЧАЛО УДАЛЕНИЯ ---
+# --- ЛОГИКА УДАЛЕНИЯ (Требует db) ---
 @dp.callback_query(F.data == "admin_delete_start")
 async def admin_start_delete(callback: types.CallbackQuery, state: FSMContext):
-    """Запрашивает подтверждение удаления ресторана."""
+    # Логика не требует db, остается прежней
     data = await state.get_data()
     rest_id = data.get('current_rest_id')
     name = data.get('current_rest_name')
     
     if not rest_id or not name:
+        # Тут нужна db, поэтому перенаправляем на функцию с db
         await callback.answer("Ошибка FSM. Вернитесь в главное меню.", show_alert=True)
-        await send_admin_panel(callback.message)
+        await admin_panel(callback.message, state, db=callback.bot.get_data()["db"])
         return
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -430,20 +425,19 @@ async def admin_start_delete(callback: types.CallbackQuery, state: FSMContext):
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
-    # Переводим в состояние ожидания подтверждения
     await state.set_state(AdminStates.waiting_for_delete_confirm)
     await callback.answer()
 
 @dp.callback_query(AdminStates.waiting_for_delete_confirm, F.data == "admin_delete_confirm")
-async def admin_finish_delete(callback: types.CallbackQuery, state: FSMContext):
-    """Выполняет удаление ресторана из БД."""
+async def admin_finish_delete(callback: types.CallbackQuery, state: FSMContext, db: Database):
+    """Выполняет удаление ресторана из БД. (db: Database - DI)"""
     data = await state.get_data()
     rest_id = data.get('current_rest_id')
     
     if not rest_id:
         await callback.answer("Ошибка: ID ресторана потерян.", show_alert=True)
         await state.clear()
-        await send_admin_panel(callback.message)
+        await send_admin_panel(callback.message, db)
         return
 
     try:
@@ -458,28 +452,28 @@ async def admin_finish_delete(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.edit_text("❌ Произошла ошибка при удалении ресторана.")
 
     await state.clear()
-    await send_admin_panel(callback.message)
+    await send_admin_panel(callback.message, db)
     await callback.answer()
 
 # --- ОСТАЛЬНЫЕ АДМИН ДЕЙСТВИЯ ---
 
 @dp.callback_query(F.data == "admin_back_to_select")
-async def admin_back_to_select(callback: types.CallbackQuery, state: FSMContext):
+async def admin_back_to_select(callback: types.CallbackQuery, state: FSMContext, db: Database):
     """Возврат из меню подтверждения удаления в меню управления рестораном."""
     await state.set_state(None) # Выходим из состояния подтверждения, но сохраняем data
-    await admin_select_rest(callback, state)
-
+    await admin_select_rest(callback, state, db)
 
 @dp.callback_query(F.data == "admin_set_qty")
 async def admin_start_set_quantity(callback: types.CallbackQuery, state: FSMContext):
-    """Начинает процесс установки количества (переводит в FSM)."""
+    # Логика не требует db, остается прежней
     data = await state.get_data()
     rest_id = data.get('current_rest_id')
     name = data.get('current_rest_name')
     
+    # ... (проверки и отправка сообщения)
     if not rest_id or not name:
         await callback.answer("Ошибка FSM. Вернитесь в главное меню.", show_alert=True)
-        await send_admin_panel(callback.message)
+        await admin_panel(callback.message, state, db=callback.bot.get_data()["db"]) # Получаем db из контекста
         return
     
     await callback.message.edit_text(
@@ -494,8 +488,8 @@ async def admin_start_set_quantity(callback: types.CallbackQuery, state: FSMCont
 
 
 @dp.message(AdminStates.waiting_for_new_quantity)
-async def admin_finish_set_quantity(message: types.Message, state: FSMContext):
-    """Обрабатывает введенное число и обновляет БД."""
+async def admin_finish_set_quantity(message: types.Message, state: FSMContext, db: Database):
+    """Обрабатывает введенное число и обновляет БД. (db: Database - DI)"""
     try:
         new_qty = int(message.text)
         if new_qty < 0:
@@ -532,30 +526,30 @@ async def admin_finish_set_quantity(message: types.Message, state: FSMContext):
     else:
         await message.answer("❌ Ошибка обновления. Ресторан не найден.")
     
-    await send_admin_panel(message)
+    await send_admin_panel(message, db)
 
 
 @dp.callback_query(F.data == "admin_back")
-async def admin_back_to_menu(callback: types.CallbackQuery, state: FSMContext):
-    """Возвращает из подменю в главное меню админа."""
+async def admin_back_to_menu(callback: types.CallbackQuery, state: FSMContext, db: Database):
+    """Возвращает из подменю в главное меню админа. (db: Database - DI)"""
     await state.clear()
     await callback.message.edit_reply_markup(reply_markup=None) 
-    await send_admin_panel(callback.message)
+    await send_admin_panel(callback.message, db)
     await callback.answer()
 
 
 @dp.callback_query(F.data == "admin_cancel_fsm")
-async def admin_cancel_fsm(callback: types.CallbackQuery, state: FSMContext):
-    """Отмена любого FSM состояния администратора."""
+async def admin_cancel_fsm(callback: types.CallbackQuery, state: FSMContext, db: Database):
+    """Отмена любого FSM состояния администратора. (db: Database - DI)"""
     await state.clear()
     await callback.message.edit_text("Операция отменена. Возврат в главное меню.")
-    await send_admin_panel(callback.message, text="Операция отменена. Возврат в главное меню.")
+    await send_admin_panel(callback.message, db, text="Операция отменена. Возврат в главное меню.")
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("admin_add_5_"))
-async def handle_admin_add_5(callback: types.CallbackQuery):
-    """Быстрое добавление +5 наборов."""
+async def handle_admin_add_5(callback: types.CallbackQuery, db: Database):
+    """Быстрое добавление +5 наборов. (db: Database - DI)"""
     rest_id = int(callback.data.split("_")[-1])
     
     try:
@@ -568,33 +562,52 @@ async def handle_admin_add_5(callback: types.CallbackQuery):
     if res:
         name, new_boxes = res['name'], res['boxes']
         await callback.message.edit_text("Обновление данных...")
-        await send_admin_panel(callback.message, text=f"✅ Наборы для {name} обновлены: **{new_boxes}** шт.")
+        await send_admin_panel(callback.message, db, text=f"✅ Наборы для {name} обновлены: **{new_boxes}** шт.")
     else:
         await callback.answer("Ошибка: Ресторан не найден.", show_alert=True)
     
     await callback.answer()
 
-# --- 9. ЗАПУСК СИСТЕМЫ ---
+# --- 7. ОБРАБОТЧИК ОШИБОК (Повышение устойчивости) ---
+
+@dp.errors()
+async def error_handler(exception, event):
+    """Общий обработчик ошибок для некритических сбоев."""
+    logging.error(f"Произошла необработанная ошибка в хэндлере {event.update.event_type.name}: {exception}")
+    if event.update.callback_query:
+        await event.update.callback_query.answer("Произошла внутренняя ошибка. Попробуйте снова.")
+    elif event.update.message:
+        await event.update.message.answer("Произошла внутренняя ошибка. Попробуйте начать заново с /start.")
+    return True # Возвращаем True, чтобы не прокидывать ошибку выше
+
+# --- 8. HTTP SERVER ДЛЯ RENDER (Health Check) ---
+async def handle_hc(request):
+    """Проверка работоспособности для хостинга (Render)."""
+    return web.Response(text="Bot is running!")
+
+async def start_http_server():
+    """Запуск небольшого HTTP-сервера для health check."""
+    app = web.Application()
+    app.router.add_get("/", handle_hc)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", Config.PORT)
+    await site.start()
+    logging.info(f"Health check server started on port {Config.PORT}")
+
+# --- 9. ЗАПУСК СИСТЕМЫ (Основная точка входа) ---
 async def main():
-    global db
-    
-    # 1. Инициализируем DAO и пул подключений к Postgres
-    db = Database()
-    try:
-        await db.init_pool(Config.DATABASE_URL)
-    except ValueError as e:
-        logging.critical(e)
-        return
-    except Exception as e:
-        logging.critical(f"Критическая ошибка подключения к БД: {e}")
-        return
-    
-    # 2. Гарантированный сброс Webhook для стабильного Polling
-    await bot.delete_webhook(drop_pending_updates=True) 
-    
-    # 3. Запускаем бота и веб-сервер одновременно
+    bot = Bot(token=Config.API_TOKEN)
+    dp = Dispatcher()
+    db_instance = Database() # Создаем экземпляр DAO
+
+    # Регистрация хуков для Graceful Shutdown
+    dp.startup.register(lambda: on_startup(dp, db_instance))
+    dp.shutdown.register(lambda: on_shutdown(dp, db_instance))
+
+    # Запускаем бота и веб-сервер одновременно
     await asyncio.gather(
-        dp.start_polling(bot),
+        dp.start_polling(bot, db=db_instance), # Передаем db как аргумент в start_polling
         start_http_server()
     )
     
