@@ -4,55 +4,62 @@ import os
 import random
 import string
 from typing import Callable, Awaitable, Dict, Any
-# --- ИМПОРТЫ AIOGRAM / POSTGRES ---
+
+# --- ИМПОРТЫ СТОРОННИХ БИБЛИОТЕК ---
 import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton, 
+    InlineKeyboardMarkup, InlineKeyboardButton, 
+    ReplyKeyboardRemove
+)
 from geopy.distance import geodesic
+
+# --- ИМПОРТ ВАШЕГО МОДУЛЯ GOOGLE SHEETS ---
+# Файл sheets.py должен лежать рядом с main.py
+try:
+    from sheets import GoogleSheetsManager
+except ImportError:
+    logging.warning("⚠️ Файл sheets.py не найден! Запись в Google Таблицы работать не будет.")
+    GoogleSheetsManager = None
 
 # Установка уровня логирования
 logging.basicConfig(level=logging.INFO)
 
-# --- 1. АРХИТЕКТУРНЫЙ СЛОЙ: КОНФИГУРАЦИЯ ---
+# --- 1. КОНФИГУРАЦИЯ ---
 class Config:
-    """Класс для централизованного управления конфигурацией."""
     API_TOKEN = os.getenv('BOT_TOKEN')
     PORT = int(os.getenv("PORT", 8080))
     DATABASE_URL = os.getenv('DATABASE_URL')
     ADMIN_ID = 1031055597 
+    # Ссылка на вашу таблицу
+    SHEET_LINK = "https://docs.google.com/spreadsheets/d/15WbaWB9Hjq7ypEMeCvJ1_FyX__b0U3MWbt8boWom5B8/edit?usp=sharing"
 
-# --- 2. АРХИТЕКТУРНЫЙ СЛОЙ: DAO (Data Access Object) ---
+# --- 2. БАЗА ДАННЫХ (PostgreSQL) ---
 class Database:
-    """Класс для инкапсуляции всех операций с базой данных (PostgreSQL)."""
     def __init__(self):
         self._pool: asyncpg.Pool = None
 
     async def init_pool(self, url: str):
-        """Инициализация пула подключений и проверка таблиц."""
         if not url:
-            raise ValueError("DATABASE_URL не установлен!")
+            logging.error("DATABASE_URL не установлен!")
+            return
         self._pool = await asyncpg.create_pool(url)
         logging.info("PostgreSQL Pool создан.")
         await self._ensure_tables_exist()
 
     async def close_pool(self):
-        """Корректное закрытие пула при завершении работы."""
         if self._pool:
             await self._pool.close()
             logging.info("PostgreSQL Pool закрыт.")
 
     async def _ensure_tables_exist(self):
-        """
-        Создает таблицы users и rests, если они не существуют.
-        КРИТИЧНО: Проверяет и добавляет необходимые колонки в 'rests',
-        если они были пропущены в предыдущих версиях.
-        """
         async with self._pool.acquire() as conn:
-            # 1. Обеспечиваем наличие таблицы users
+            # Таблица пользователей
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     id BIGINT PRIMARY KEY,
@@ -62,45 +69,33 @@ class Database:
                     lon REAL
                 )
             ''')
-            
-            # 2. Обеспечиваем наличие базовой таблицы rests (если она еще не была создана)
+            # Таблица ресторанов
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS rests (
                     id SERIAL PRIMARY KEY,
-                    name TEXT
+                    name TEXT,
+                    lat REAL,
+                    lon REAL,
+                    boxes INTEGER DEFAULT 5
                 )
             ''')
             
-            # 3. Проверка и добавление недостающих колонок в rests (Schema Migration)
-            
-            # Вспомогательная функция для проверки наличия колонки
-            async def column_exists(table_name, column_name):
-                query = """
-                SELECT 1 
-                FROM information_schema.columns 
-                WHERE table_name=$1 AND column_name=$2
-                """
-                return await conn.fetchval(query, table_name, column_name)
-            
-            # Проверка и добавление 'lat'
+            # Миграции (добавление колонок, если их нет)
+            async def column_exists(table, col):
+                val = await conn.fetchval(
+                    "SELECT 1 FROM information_schema.columns WHERE table_name=$1 AND column_name=$2", 
+                    table, col
+                )
+                return val is not None
+
             if not await column_exists('rests', 'lat'):
                 await conn.execute('ALTER TABLE rests ADD COLUMN lat REAL')
-                logging.warning("Колонка 'lat' добавлена в таблицу rests.")
-                
-            # Проверка и добавление 'lon'
             if not await column_exists('rests', 'lon'):
                 await conn.execute('ALTER TABLE rests ADD COLUMN lon REAL')
-                logging.warning("Колонка 'lon' добавлена в таблицу rests.")
-                
-            # Проверка и добавление 'boxes'
             if not await column_exists('rests', 'boxes'):
-                # Добавляем с DEFAULT 5, чтобы не сломать существующие строки
                 await conn.execute('ALTER TABLE rests ADD COLUMN boxes INTEGER DEFAULT 5')
-                logging.warning("Колонка 'boxes' добавлена в таблицу rests.")
 
-        logging.info("Database tables проверены, и схема обновлена.")
-
-    # --- CRUD: USERS ---
+    # --- SQL ЗАПРОСЫ ---
     async def create_or_update_user(self, user_id, name, phone, lat, lon):
         await self._pool.execute(
             'INSERT INTO users (id, name, phone, lat, lon) VALUES ($1, $2, $3, $4, $5) '
@@ -108,7 +103,6 @@ class Database:
             user_id, name, phone, lat, lon
         )
 
-    # --- CRUD: RESTAURANTS (for User/Admin) ---
     async def get_active_rests(self):
         return await self._pool.fetch('SELECT name, lat, lon, boxes, id FROM rests WHERE boxes > 0')
 
@@ -143,10 +137,7 @@ class Database:
         )
 
     async def delete_rest_by_id(self, rest_id):
-        return await self._pool.fetchval(
-            'DELETE FROM rests WHERE id = $1 RETURNING name',
-            rest_id
-        )
+        return await self._pool.fetchval('DELETE FROM rests WHERE id = $1 RETURNING name', rest_id)
 
 # --- 3. FSM СОСТОЯНИЯ ---
 class Reg(StatesGroup):
@@ -160,66 +151,41 @@ class AdminStates(StatesGroup):
     adding_rest_location = State() 
     waiting_for_delete_confirm = State() 
 
-# --- 4. MIDDLEWARE: ADMIN ACCESS CONTROL ---
+# --- 4. MIDDLEWARE (Защита админки) ---
 class AdminAccessMiddleware(BaseMiddleware):
-    """Проверяет, является ли пользователь администратором."""
     def __init__(self, admin_id: int):
         super().__init__()
         self.admin_id = admin_id
 
-    async def __call__(
-        self,
-        handler: Callable[[types.Message, Dict[str, Any]], Awaitable[Any]],
-        event: types.Message,
-        data: Dict[str, Any]
-    ) -> Any:
-        
+    async def __call__(self, handler, event, data):
         user_id = event.from_user.id
-        
-        is_admin_command = (isinstance(event, types.Message) and event.text == '/admin')
-        is_admin_callback = (isinstance(event, types.CallbackQuery) and event.data.startswith('admin_'))
+        # Проверяем, пытаются ли войти в админку
+        is_admin_action = (
+            (isinstance(event, types.Message) and event.text == '/admin') or
+            (isinstance(event, types.CallbackQuery) and str(event.data).startswith('admin_'))
+        )
 
-        if user_id == self.admin_id or not (is_admin_command or is_admin_callback):
+        if user_id == self.admin_id or not is_admin_action:
             return await handler(event, data)
         else:
             if isinstance(event, types.Message):
-                await event.answer("Access denied.")
+                await event.answer("⛔ Access denied.")
             elif isinstance(event, types.CallbackQuery):
-                await event.answer("Access denied.", show_alert=True)
-            return # Остановить распространение
+                await event.answer("⛔ Access denied.", show_alert=True)
+            return
 
-# --- 5. INITIALIZATION AND SHUTDOWN HOOKS ---
-async def on_startup(dispatcher: Dispatcher, db: Database):
-    """Выполняется при запуске бота."""
-    try:
-        await db.init_pool(Config.DATABASE_URL)
-        dispatcher["db"] = db 
-        logging.info("Система готова. База данных подключена и передана в контекст.")
-    except Exception as e:
-        logging.critical(f"Критическая ошибка инициализации БД: {e}")
-        # Если здесь ошибка, бот, возможно, не сможет работать, но продолжит работу для health check.
-        # await dispatcher.stop_polling() # Оставляем закомментированным для хостинга
-        
+# --- 5. ЛОГИКА БОТА ---
+dp = Dispatcher()
 
-async def on_shutdown(dispatcher: Dispatcher, db: Database):
-    """Выполняется при остановке бота."""
-    await db.close_pool()
-    logging.info("Система остановлена. Ресурсы освобождены.")
-
-# --- 6. ОБРАБОТЧИКИ: ЛОГИКА ПОЛЬЗОВАТЕЛЯ (User Flow) ---
-
-dp = Dispatcher() 
-
+# === ЮЗЕР: РЕГИСТРАЦИЯ ===
 @dp.message(Command("start"))
 async def start(message: types.Message, state: FSMContext):
-    """Шаг 1: Начало регистрации/входа."""
     await state.clear()
     await message.answer("Xush kelibsiz! «Uvol bo'lmasin»! 😊\nВведите Имя и Фамилию:")
     await state.set_state(Reg.name)
 
 @dp.message(Reg.name, F.text)
 async def get_name(message: types.Message, state: FSMContext):
-    """Шаг 2: Получение имени (текст) и запрос телефона."""
     await state.update_data(name=message.text)
     kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📱 Отправить номер", request_contact=True)]], 
@@ -228,14 +194,8 @@ async def get_name(message: types.Message, state: FSMContext):
     await message.answer("Отправьте номер телефона кнопкой ниже:", reply_markup=kb)
     await state.set_state(Reg.phone)
 
-@dp.message(Reg.name)
-async def invalid_input_name_non_text(message: types.Message):
-    """Перехват нетекстового ввода в состоянии ожидания имени."""
-    await message.answer("❌ Ожидался ввод имени (текст). Пожалуйста, введите ваше имя.")
-
 @dp.message(Reg.phone, F.contact)
 async def get_phone(message: types.Message, state: FSMContext):
-    """Шаг 3: Получение телефона (контакт) и запрос локации."""
     await state.update_data(phone=message.contact.phone_number)
     kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📍 Отправить локацию", request_location=True)]], 
@@ -244,52 +204,46 @@ async def get_phone(message: types.Message, state: FSMContext):
     await message.answer("Отправьте геолокацию, чтобы найти еду рядом:", reply_markup=kb)
     await state.set_state(Reg.location)
 
-@dp.message(Reg.phone)
-async def invalid_input_phone_non_contact(message: types.Message):
-    """Перехват неконтактного ввода в состоянии ожидания телефона."""
-    await message.answer("❌ Ожидалась отправка номера телефона через специальную кнопку.")
-
 @dp.message(Reg.location, F.location)
-async def get_loc(message: types.Message, state: FSMContext, db: Database):
-    """Шаг 4: Получение локации (геолокация), сохранение и показ ресторанов."""
+async def get_loc(message: types.Message, state: FSMContext, db: Database, gs: Any):
+    """Финал регистрации: сохранение в БД и Google Sheets."""
     data = await state.get_data()
     lat, lon = message.location.latitude, message.location.longitude
     
+    # 1. Сохраняем в PostgreSQL
     try:
         await db.create_or_update_user(message.from_user.id, data['name'], data['phone'], lat, lon)
     except Exception as e:
-        logging.error(f"DB Error (User registration): {e}")
-        await message.answer("❌ Произошла ошибка при сохранении данных. Попробуйте снова.")
+        logging.error(f"DB Error: {e}")
+        await message.answer("❌ Ошибка базы данных.")
         return
-    
+
+    # 2. Сохраняем в Google Sheets (фоновая задача)
+    if gs:
+        asyncio.create_task(gs.add_user(
+            user_id=message.from_user.id,
+            username=message.from_user.username or "NoUsername",
+            name=data['name'],
+            phone=data['phone'],
+            lat=lat,
+            lon=lon
+        ))
+
     await message.answer("✅ Регистрация завершена!", reply_markup=ReplyKeyboardRemove())
     await state.clear()
     await show_restaurants(message, lat, lon, db)
 
-@dp.message(Reg.location)
-async def invalid_input_location_non_location(message: types.Message):
-    """Перехват негеолокационного ввода в состоянии ожидания локации."""
-    await message.answer("❌ Ожидалась отправка геолокации через специальную кнопку.")
-
-
+# === ЮЗЕР: ПОИСК И БРОНЬ ===
 async def show_restaurants(message, u_lat, u_lon, db: Database):
-    """Поиск и отображение ближайших активных ресторанов."""
-    try:
-        rests = await db.get_active_rests()
-    except Exception as e:
-        # Теперь эта ошибка должна быть менее вероятной из-за проверки схемы
-        logging.error(f"DB Error (Get rests): {e}") 
-        await message.answer("❌ Ошибка при загрузке данных о ресторанах.")
-        return
-
+    rests = await db.get_active_rests()
     if not rests:
-        await message.answer("К сожалению, сейчас нет активных предложений рядом с вами. 😔")
+        await message.answer("К сожалению, сейчас нет активных предложений рядом. 😔")
         return
 
     nearby = []
     for r in rests:
         dist = geodesic((u_lat, u_lon), (r['lat'], r['lon'])).km
-        if dist < 10: # Показываем в радиусе 10км
+        if dist < 10: # Радиус 10 км
             nearby.append((r['name'], dist, r['boxes'], r['id']))
     
     nearby.sort(key=lambda x: x[1])
@@ -298,452 +252,197 @@ async def show_restaurants(message, u_lat, u_lon, db: Database):
         await message.answer("Рядом с вами (в радиусе 10км) ничего не найдено.")
         return
 
-    text = "🥡 Доступные наборы (15 000 сум):\n\n"
+    text = "🥡 **Доступные наборы (15 000 сум):**\n\n"
     buttons = []
     for r in nearby:
         text += f"📍 {r[0]} ({r[1]:.1f} км) — Осталось: {r[2]} шт.\n"
         buttons.append([InlineKeyboardButton(text=f"Забронировать в {r[0]}", callback_data=f"book_{r[3]}")])
 
-    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("book_"))
 async def handle_booking(callback: types.CallbackQuery, db: Database):
-    """Обработка бронирования с атомарным уменьшением наборов."""
     rest_id = int(callback.data.split("_")[1])
-    
-    try:
-        res = await db.decrement_boxes_atomic(rest_id)
-    except Exception as e:
-        logging.error(f"DB Error (Booking): {e}")
-        await callback.answer("❌ Произошла ошибка бронирования. Попробуйте позже.", show_alert=True)
-        return
+    res = await db.decrement_boxes_atomic(rest_id)
         
     if res:
-        name, new_boxes = res['name'], res['boxes']
+        name = res['name']
         code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
         await callback.message.edit_text(
             f"✅ Успешно! Ресторан: **{name}**\n"
             f"Ваш код брони: `{code}`\n"
-            f"Покажите его сотруднику для оплаты и получения.",
+            f"Покажите его сотруднику для оплаты.",
             parse_mode="Markdown"
         )
     else:
-        await callback.answer("Увы, наборы в этом заведении уже закончились!", show_alert=True)
-        try:
-             await callback.message.delete()
-        except:
-             pass 
+        await callback.answer("Увы, наборы закончились!", show_alert=True)
+        try: await callback.message.delete()
+        except: pass
 
-# ... внутри функции регистрации ...
-
-# 1. (Ваш старый код) Сохраняем в PostgreSQL
-await db.add_user(user_id, name, phone, lat, lon)
-
-# 2. (НОВЫЙ КОД) Отправляем в Google Sheets в фоновом режиме
-# Мы используем create_task, чтобы бот НЕ ждал секунду, пока ответит Google
-asyncio.create_task(gs_manager.add_user(
-    user_id=message.from_user.id,
-    username=message.from_user.username,
-    name=name,   # Берем из state data
-    phone=phone, # Берем из state data
-    lat=message.location.latitude,
-    lon=message.location.longitude
-))
-
-# 3. (Ваш старый код) Завершаем стейт и отвечаем юзеру
-await state.clear()
-await message.answer("Регистрация успешна!")
-
-# --- 7. ОБРАБОТЧИКИ: ЛОГИКА АДМИНИСТРАТОРА (Admin Flow) ---
-
-async def send_admin_panel(message: types.Message, db: Database, text: str = None):
-    """Отправляет или редактирует главное меню админ-панели."""
-    try:
-        rests = await db.get_all_rests()
-    except Exception as e:
-        # Теперь эта ошибка должна быть менее вероятной из-за проверки схемы
-        logging.error(f"DB Error (Get all rests): {e}") 
-        await message.answer("❌ Ошибка при загрузке списка ресторанов.")
-        return
-    
-    text = text if text else "⚙️ **Панель Управления Ресторанами** ⚙️\nВыберите ресторан для управления:"
-    
-    def get_admin_main_keyboard(rests):
-        buttons = []
-        for r in rests:
-            rest_id, name, boxes = r['id'], r['name'], r['boxes']
-            buttons.append([InlineKeyboardButton(text=f"📍 {name} (Наборов: {boxes})", callback_data=f"admin_select_{rest_id}")])
-        
-        buttons.append([InlineKeyboardButton(text="➕ Добавить Новый Ресторан", callback_data="admin_add_new")])
-        return InlineKeyboardMarkup(inline_keyboard=buttons)
-    
-    await message.answer(text, reply_markup=get_admin_main_keyboard(rests), parse_mode="Markdown")
-
+# === АДМИН ПАНЕЛЬ ===
 @dp.message(Command("admin"))
 async def admin_panel(message: types.Message, state: FSMContext, db: Database):
-    """Главный вход в админ-панель."""
-    await state.clear() 
-    await send_admin_panel(message, db)
-
-# --- ДОБАВЛЕНИЕ РЕСТОРАНА ---
-
-@dp.callback_query(F.data == "admin_add_new")
-async def admin_start_add_new(callback: types.CallbackQuery, state: FSMContext):
-    """Начало добавления ресторана. Запрос названия."""
     await state.clear()
-    await callback.message.edit_text(
-        "📝 **ДОБАВЛЕНИЕ РЕСТОРАНА**\n\nВведите **Название** нового ресторана:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel_fsm")]
-        ]),
-        parse_mode="Markdown"
-    )
+    await send_admin_menu(message, db)
+
+async def send_admin_menu(message: types.Message, db: Database, text=None):
+    rests = await db.get_all_rests()
+    text = text or "⚙️ **Панель Управления**\nВыберите действие:"
+    
+    buttons = []
+    for r in rests:
+        buttons.append([InlineKeyboardButton(text=f"📍 {r['name']} (Ост: {r['boxes']})", callback_data=f"admin_select_{r['id']}")])
+    
+    buttons.append([InlineKeyboardButton(text="➕ Добавить Ресторан", callback_data="admin_add_new")])
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+
+# --- Добавление ресторана ---
+@dp.callback_query(F.data == "admin_add_new")
+async def admin_add_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Введите **Название** ресторана:", parse_mode="Markdown")
     await state.set_state(AdminStates.adding_rest_name)
-    await callback.answer()
 
-@dp.message(AdminStates.adding_rest_name, F.text) # СТРОГАЯ ФИЛЬТРАЦИЯ
-async def admin_get_rest_name(message: types.Message, state: FSMContext):
-    """Получение названия (ТОЛЬКО ТЕКСТ) и запрос локации."""
-    name = message.text.strip()
-    if not name or len(name) < 2 or len(name) > 50:
-        await message.answer("❌ Название должно быть от 2 до 50 символов. Попробуйте снова.")
-        return
-
-    await state.update_data(new_rest_name=name)
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📍 Отправить локацию", request_location=True)]], 
-        resize_keyboard=True, one_time_keyboard=True
-    )
-    await message.answer(
-        f"✅ Название сохранено: **{name}**\n\nТеперь отправьте **Геолокацию** ресторана (используйте кнопку ниже).",
-        reply_markup=kb,
-        parse_mode="Markdown"
-    )
+@dp.message(AdminStates.adding_rest_name, F.text)
+async def admin_add_name(message: types.Message, state: FSMContext):
+    await state.update_data(new_rest_name=message.text)
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📍 Локация", request_location=True)]], resize_keyboard=True)
+    await message.answer("Теперь отправьте **Геолокацию**:", reply_markup=kb, parse_mode="Markdown")
     await state.set_state(AdminStates.adding_rest_location)
 
-@dp.message(AdminStates.adding_rest_name) # Обработчик для НЕ-ТЕКСТА
-async def admin_invalid_input_name(message: types.Message):
-    """Перехват неверного ввода в состоянии ожидания названия."""
-    await message.answer("❌ Ожидался ввод текстового названия ресторана. Пожалуйста, введите текст.")
-
 @dp.message(AdminStates.adding_rest_location, F.location)
-async def admin_get_rest_location(message: types.Message, state: FSMContext, db: Database):
-    """Получает локацию (ТОЛЬКО ЛОКАЦИЯ), сохраняет в БД и завершает FSM."""
+async def admin_add_loc(message: types.Message, state: FSMContext, db: Database, gs: Any):
     data = await state.get_data()
-    name = data.get('new_rest_name')
+    name = data['new_rest_name']
     lat, lon = message.location.latitude, message.location.longitude
+
+    # 1. БД
+    await db.insert_new_rest(name, lat, lon)
     
-    if not name:
-        await message.answer("❌ Ошибка: Название ресторана потеряно. Начните сначала с /admin.", reply_markup=ReplyKeyboardRemove())
-        await state.clear()
-        return
+    # 2. Google Sheets
+    if gs:
+        asyncio.create_task(gs.add_restaurant(rest_name=name, lat=lat, lon=lon))
 
-    try:
-        await db.insert_new_rest(name, lat, lon)
-        
-        await message.answer(
-            f"🎉 **Ресторан успешно добавлен!**\n\n"
-            f"Название: **{name}**\n"
-            f"Начальное количество наборов: 5",
-            reply_markup=ReplyKeyboardRemove(),
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logging.error(f"DB Error (Insert rest): {e}")
-        await message.answer("❌ Произошла ошибка при сохранении данных в базу.", reply_markup=ReplyKeyboardRemove())
-
+    await message.answer(f"✅ Ресторан **{name}** добавлен!", reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
     await state.clear()
-    await send_admin_panel(message, db)
-    
-@dp.message(AdminStates.adding_rest_location)
-async def admin_invalid_input_location(message: types.Message):
-    """Перехват неверного ввода в состоянии ожидания локации."""
-    await message.answer("❌ Ожидалась отправка геолокации через специальную кнопку. Пожалуйста, отправьте локацию.")
+    await send_admin_menu(message, db)
 
-# ... внутри функции добавления ресторана ...
-
-# 1. (Ваш старый код) Сохраняем в БД
-await db.add_restaurant(rest_name, lat, lon)
-
-# 2. (НОВЫЙ КОД) Отправляем в Google Sheets
-asyncio.create_task(gs_manager.add_restaurant(
-    rest_name=data.get('rest_name'),
-    lat=message.location.latitude,
-    lon=message.location.longitude
-))
-
-# 3. Ответ админу
-await message.answer("Ресторан добавлен в БД и Таблицу!")
-
-
-# --- УПРАВЛЕНИЕ КОЛИЧЕСТВОМ И УДАЛЕНИЕ ---
-
+# --- Управление рестораном ---
 @dp.callback_query(F.data.startswith("admin_select_"))
-async def admin_select_rest(callback: types.CallbackQuery, state: FSMContext, db: Database):
-    """Показывает подменю управления выбранным рестораном."""
+async def admin_rest_options(callback: types.CallbackQuery, state: FSMContext, db: Database):
     rest_id = int(callback.data.split("_")[-1])
-    
-    try:
-        rest = await db.get_rest_details(rest_id)
-    except Exception as e:
-        logging.error(f"DB Error (Get rest details): {e}")
-        await callback.answer("Ошибка БД. Не удалось загрузить данные.", show_alert=True)
-        return
-
+    rest = await db.get_rest_details(rest_id)
     if not rest:
-        await callback.answer("Ресторан не найден.", show_alert=True)
-        return
+        return await callback.answer("Ресторан не найден", show_alert=True)
     
-    name, boxes = rest['name'], rest['boxes']
-    
-    await state.update_data(current_rest_id=rest_id, current_rest_name=name)
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎯 Установить Количество", callback_data="admin_set_qty")],
-        [InlineKeyboardButton(text="➕ Добавить +5 наборов (Быстро)", callback_data=f"admin_add_5_{rest_id}")],
-        [InlineKeyboardButton(text="🗑️ Удалить Ресторан", callback_data="admin_delete_start")], 
-        [InlineKeyboardButton(text="⬅️ Назад к списку", callback_data="admin_back")]
+    await state.update_data(cur_id=rest_id, cur_name=rest['name'])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Изм. кол-во", callback_data="admin_set_qty")],
+        [InlineKeyboardButton(text="➕ Быстро +5", callback_data=f"admin_add_5_{rest_id}")],
+        [InlineKeyboardButton(text="🗑️ Удалить", callback_data="admin_del_ask")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]
     ])
-    
-    await callback.message.edit_text(
-        f"🛠️ **Управление: {name}**\n\nТекущий остаток: **{boxes}** наборов.",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_set_qty")
-async def admin_start_set_quantity(callback: types.CallbackQuery, state: FSMContext):
-    """Начало установки нового количества."""
-    data = await state.get_data()
-    name = data.get('current_rest_name')
-    
-    if not name:
-        await callback.answer("Ошибка FSM. Вернитесь в главное меню.", show_alert=True)
-        db_instance = callback.bot.get_data()["db"] 
-        await admin_panel(callback.message, state, db=db_instance)
-        return
-    
-    await callback.message.edit_text(
-        f"**Введите НОВОЕ общее количество наборов для ресторана {name}.**\n\n(Только целое число, например: **30**)",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel_fsm")]
-        ]),
-        parse_mode="Markdown"
-    )
-    await state.set_state(AdminStates.waiting_for_new_quantity)
-    await callback.answer()
-
-
-@dp.message(AdminStates.waiting_for_new_quantity, F.text) # СТРОГАЯ ФИЛЬТРАЦИЯ
-async def admin_finish_set_quantity(message: types.Message, state: FSMContext, db: Database):
-    """Обрабатывает введенное число (ТОЛЬКО ТЕКСТ) и обновляет БД."""
-    data = await state.get_data()
-    rest_id = data.get('current_rest_id')
-    
-    try:
-        new_qty = int(message.text)
-        if new_qty < 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Неверный ввод. Пожалуйста, введите **целое положительное число**.")
-        return
-        
-    if not rest_id:
-        await message.answer("❌ Ошибка: Ресторан не выбран. Начните с /admin.", reply_markup=ReplyKeyboardRemove())
-        await state.clear()
-        return
-
-    try:
-        res = await db.set_boxes_quantity(rest_id, new_qty)
-    except Exception as e:
-        logging.error(f"DB Error (Set quantity): {e}")
-        await message.answer("❌ Ошибка обновления. Не удалось связаться с базой данных.")
-        res = None
-    
-    await state.clear()
-    
-    if res:
-        name, boxes = res['name'], res['boxes']
-        await message.answer(
-            f"✅ **Успешно обновлено!**\n\n"
-            f"Ресторан: **{name}**\n"
-            f"Установлено: **{boxes}** наборов.",
-            parse_mode="Markdown"
-        )
-    else:
-        await message.answer("❌ Ошибка обновления. Ресторан не найден.")
-    
-    await send_admin_panel(message, db)
-
-@dp.message(AdminStates.waiting_for_new_quantity)
-async def admin_invalid_input_quantity(message: types.Message):
-    """Перехват неверного ввода в состоянии ожидания количества."""
-    await message.answer("❌ Ожидался ввод целого положительного числа. Пожалуйста, введите число.")
-
-
-# --- УДАЛЕНИЕ ---
-
-@dp.callback_query(F.data == "admin_delete_start")
-async def admin_start_delete(callback: types.CallbackQuery, state: FSMContext):
-    """Запрос подтверждения удаления."""
-    data = await state.get_data()
-    rest_id = data.get('current_rest_id')
-    name = data.get('current_rest_name')
-    
-    if not rest_id or not name:
-        await callback.answer("Ошибка FSM. Вернитесь в главное меню.", show_alert=True)
-        db_instance = callback.bot.get_data()["db"] 
-        await admin_panel(callback.message, state, db=db_instance)
-        return
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"✅ Подтвердить Удаление {name}", callback_data="admin_delete_confirm")],
-        [InlineKeyboardButton(text="❌ Отмена (Вернуться)", callback_data="admin_back_to_select")]
-    ])
-    
-    await callback.message.edit_text(
-        f"⚠️ **ВНИМАНИЕ! ПОДТВЕРДИТЕ УДАЛЕНИЕ**\n\nВы собираетесь безвозвратно удалить ресторан **{name}** (ID: {rest_id}) из системы.",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
-    await state.set_state(AdminStates.waiting_for_delete_confirm)
-    await callback.answer()
-
-@dp.callback_query(AdminStates.waiting_for_delete_confirm, F.data == "admin_delete_confirm")
-async def admin_finish_delete(callback: types.CallbackQuery, state: FSMContext, db: Database):
-    """Выполняет удаление ресторана из БД."""
-    data = await state.get_data()
-    rest_id = data.get('current_rest_id')
-    
-    if not rest_id:
-        await callback.answer("Ошибка: ID ресторана потерян.", show_alert=True)
-        await state.clear()
-        await send_admin_panel(callback.message, db)
-        return
-
-    try:
-        deleted_name = await db.delete_rest_by_id(rest_id)
-        
-        await callback.message.edit_text(
-            f"🗑️ Ресторан **{deleted_name or rest_id}** успешно удален из системы.",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logging.error(f"DB Error (Delete rest): {e}")
-        await callback.message.edit_text("❌ Произошла ошибка при удалении ресторана.")
-
-    await state.clear()
-    await send_admin_panel(callback.message, db)
-    await callback.answer()
-
-# --- ВСПОМОГАТЕЛЬНЫЕ АДМИН ДЕЙСТВИЯ ---
-
-@dp.callback_query(F.data == "admin_back_to_select")
-async def admin_back_to_select(callback: types.CallbackQuery, state: FSMContext, db: Database):
-    """Возврат из меню подтверждения удаления в меню управления рестораном."""
-    await state.set_state(None)
-    await admin_select_rest(callback, state, db)
+    await callback.message.edit_text(f"📍 **{rest['name']}**\nНаборов: {rest['boxes']}", reply_markup=kb, parse_mode="Markdown")
 
 @dp.callback_query(F.data == "admin_back")
-async def admin_back_to_menu(callback: types.CallbackQuery, state: FSMContext, db: Database):
-    """Возвращает из подменю в главное меню админа."""
+async def back_to_main(callback: types.CallbackQuery, state: FSMContext, db: Database):
     await state.clear()
-    await callback.message.edit_reply_markup(reply_markup=None) 
-    await send_admin_panel(callback.message, db)
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "admin_cancel_fsm")
-async def admin_cancel_fsm(callback: types.CallbackQuery, state: FSMContext, db: Database):
-    """Отмена любого FSM состояния администратора."""
-    await state.clear()
-    await callback.message.edit_text("Операция отменена. Возврат в главное меню.")
-    await send_admin_panel(callback.message, db, text="Операция отменена. Возврат в главное меню.")
-    await callback.answer()
-
+    await callback.message.delete()
+    await send_admin_menu(callback.message, db)
 
 @dp.callback_query(F.data.startswith("admin_add_5_"))
-async def handle_admin_add_5(callback: types.CallbackQuery, db: Database):
-    """Быстрое добавление +5 наборов."""
+async def quick_add(callback: types.CallbackQuery, db: Database):
     rest_id = int(callback.data.split("_")[-1])
-    
+    await db.increment_boxes(rest_id, 5)
+    await callback.answer("+5 наборов добавлено!")
+    # Обновляем меню
+    rest = await db.get_rest_details(rest_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Изм. кол-во", callback_data="admin_set_qty")],
+        [InlineKeyboardButton(text="➕ Быстро +5", callback_data=f"admin_add_5_{rest_id}")],
+        [InlineKeyboardButton(text="🗑️ Удалить", callback_data="admin_del_ask")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]
+    ])
     try:
-        res = await db.increment_boxes(rest_id, 5)
-    except Exception as e:
-        logging.error(f"DB Error (Add 5): {e}")
-        await callback.answer("❌ Ошибка при добавлении наборов.", show_alert=True)
-        res = None
-        
-    if res:
-        name, new_boxes = res['name'], res['boxes']
-        await callback.message.edit_text("Обновление данных...")
-        await send_admin_panel(callback.message, db, text=f"✅ Наборы для {name} обновлены: **{new_boxes}** шт.")
-    else:
-        await callback.answer("Ошибка: Ресторан не найден.", show_alert=True)
+        await callback.message.edit_text(f"📍 **{rest['name']}**\nНаборов: {rest['boxes']}", reply_markup=kb, parse_mode="Markdown")
+    except: pass
+
+@dp.callback_query(F.data == "admin_set_qty")
+async def set_qty_ask(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Введите новое количество (число):")
+    await state.set_state(AdminStates.waiting_for_new_quantity)
+
+@dp.message(AdminStates.waiting_for_new_quantity)
+async def set_qty_done(message: types.Message, state: FSMContext, db: Database):
+    if not message.text.isdigit():
+        return await message.answer("Введите число!")
     
-    await callback.answer()
+    data = await state.get_data()
+    await db.set_boxes_quantity(data['cur_id'], int(message.text))
+    await message.answer("✅ Количество обновлено.")
+    await state.clear()
+    await send_admin_menu(message, db)
 
-# --- 8. ОБРАБОТЧИК ОШИБОК ---
+@dp.callback_query(F.data == "admin_del_ask")
+async def del_ask(callback: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить", callback_data="admin_del_confirm")],
+        [InlineKeyboardButton(text="❌ Нет", callback_data="admin_back")]
+    ])
+    await callback.message.edit_text("Вы уверены? Это действие необратимо.", reply_markup=kb)
 
-@dp.errors()
-async def error_handler(exception, event):
-    """Общий обработчик ошибок для некритических сбоев."""
-    logging.error(f"Произошла необработанная ошибка в хэндлере {event.update.event_type.name}: {exception}")
-    if event.update.callback_query:
-        await event.update.callback_query.answer("Произошла внутренняя ошибка. Попробуйте снова.")
-    elif event.update.message:
-        await event.update.message.answer("Произошла внутренняя ошибка. Попробуйте начать заново с /start.")
-    return True
+@dp.callback_query(F.data == "admin_del_confirm")
+async def del_confirm(callback: types.CallbackQuery, state: FSMContext, db: Database):
+    data = await state.get_data()
+    await db.delete_rest_by_id(data['cur_id'])
+    await callback.answer("Ресторан удален.")
+    await state.clear()
+    await callback.message.delete()
+    await send_admin_menu(callback.message, db)
 
-# --- 9. HTTP SERVER ДЛЯ RENDER (Health Check) ---
+# --- 6. HEALTH CHECK (Для Render) ---
 async def handle_hc(request):
-    """Проверка работоспособности для хостинга (Render)."""
-    return web.Response(text="Bot is running!")
+    return web.Response(text="Bot is running OK!")
 
 async def start_http_server():
-    """Запуск небольшого HTTP-сервера для health check."""
     app = web.Application()
     app.router.add_get("/", handle_hc)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", Config.PORT)
     await site.start()
-    logging.info(f"Health check server started on port {Config.PORT}")
 
-# --- 10. ЗАПУСК СИСТЕМЫ (Основная точка входа) ---
+# --- 7. ЗАПУСК ---
 async def main():
     bot = Bot(token=Config.API_TOKEN)
-    db_instance = Database() 
+    db = Database()
     
-    # 1. Регистрация Middleware (для защиты админки)
+    # Инициализация Google Sheets
+    gs = None
+    if GoogleSheetsManager:
+        try:
+            gs = GoogleSheetsManager(Config.https://docs.google.com/spreadsheets/d/15WbaWB9Hjq7ypEMeCvJ1_FyX__b0U3MWbt8boWom5B8/edit?usp=sharing)
+            logging.info("✅ Google Sheets подключены.")
+        except Exception as e:
+            logging.error(f"❌ Ошибка Google Sheets: {e}")
+
+    # Регистрация Middleware
     dp.message.middleware(AdminAccessMiddleware(Config.ADMIN_ID))
     dp.callback_query.middleware(AdminAccessMiddleware(Config.ADMIN_ID))
 
-    # 2. Регистрация хуков для Graceful Shutdown
-    dp.startup.register(lambda: on_startup(dp, db_instance))
-    dp.shutdown.register(lambda: on_shutdown(dp, db_instance))
+    # Запуск
+    await db.init_pool(Config.DATABASE_URL)
+    try:
+        logging.info("🚀 Бот запускается...")
+        # Передаем db и gs в диспетчер, чтобы они были доступны в хендлерах
+        await asyncio.gather(
+            dp.start_polling(bot, db=db, gs=gs),
+            start_http_server()
+        )
+    finally:
+        await db.close_pool()
 
-    # 3. Запуск бота и веб-сервера
-    await asyncio.gather(
-        dp.start_polling(bot, db=db_instance), 
-        start_http_server()
-    )
-    
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-    except Exception as e:
-        logging.critical(f"Критическая ошибка в main(): {e}")
-
-# Импортируем наш новый класс
-from sheets import GoogleSheetsManager
-
-# 1. Ссылка в кавычках
-SHEET_LINK = "https://docs.google.com/spreadsheets/d/15WbaWB9Hjq7ypEMeCvJ1_FyX__b0U3MWbt8boWom5B8/edit?usp=sharing"
-
-# 2. Передаем переменную (БЕЗ кавычек внутри скобок, так как это имя переменной)
-gs_manager = GoogleSheetsManager(https://docs.google.com/spreadsheets/d/15WbaWB9Hjq7ypEMeCvJ1_FyX__b0U3MWbt8boWom5B8/edit?usp=sharing)
