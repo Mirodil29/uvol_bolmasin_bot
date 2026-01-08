@@ -335,6 +335,26 @@ async def handle_booking(callback: types.CallbackQuery, db: Database):
         except:
              pass 
 
+# ... внутри функции регистрации ...
+
+# 1. (Ваш старый код) Сохраняем в PostgreSQL
+await db.add_user(user_id, name, phone, lat, lon)
+
+# 2. (НОВЫЙ КОД) Отправляем в Google Sheets в фоновом режиме
+# Мы используем create_task, чтобы бот НЕ ждал секунду, пока ответит Google
+asyncio.create_task(gs_manager.add_user(
+    user_id=message.from_user.id,
+    username=message.from_user.username,
+    name=name,   # Берем из state data
+    phone=phone, # Берем из state data
+    lat=message.location.latitude,
+    lon=message.location.longitude
+))
+
+# 3. (Ваш старый код) Завершаем стейт и отвечаем юзеру
+await state.clear()
+await message.answer("Регистрация успешна!")
+
 # --- 7. ОБРАБОТЧИКИ: ЛОГИКА АДМИНИСТРАТОРА (Admin Flow) ---
 
 async def send_admin_panel(message: types.Message, db: Database, text: str = None):
@@ -440,6 +460,21 @@ async def admin_get_rest_location(message: types.Message, state: FSMContext, db:
 async def admin_invalid_input_location(message: types.Message):
     """Перехват неверного ввода в состоянии ожидания локации."""
     await message.answer("❌ Ожидалась отправка геолокации через специальную кнопку. Пожалуйста, отправьте локацию.")
+
+# ... внутри функции добавления ресторана ...
+
+# 1. (Ваш старый код) Сохраняем в БД
+await db.add_restaurant(rest_name, lat, lon)
+
+# 2. (НОВЫЙ КОД) Отправляем в Google Sheets
+asyncio.create_task(gs_manager.add_restaurant(
+    rest_name=data.get('rest_name'),
+    lat=message.location.latitude,
+    lon=message.location.longitude
+))
+
+# 3. Ответ админу
+await message.answer("Ресторан добавлен в БД и Таблицу!")
 
 
 # --- УПРАВЛЕНИЕ КОЛИЧЕСТВОМ И УДАЛЕНИЕ ---
@@ -703,3 +738,12 @@ if __name__ == "__main__":
         pass
     except Exception as e:
         logging.critical(f"Критическая ошибка в main(): {e}")
+
+# Импортируем наш новый класс
+from sheets import GoogleSheetsManager
+
+# 1. Ссылка в кавычках
+SHEET_LINK = "https://docs.google.com/spreadsheets/d/15WbaWB9Hjq7ypEMeCvJ1_FyX__b0U3MWbt8boWom5B8/edit?usp=sharing"
+
+# 2. Передаем переменную (БЕЗ кавычек внутри скобок, так как это имя переменной)
+gs_manager = GoogleSheetsManager(https://docs.google.com/spreadsheets/d/15WbaWB9Hjq7ypEMeCvJ1_FyX__b0U3MWbt8boWom5B8/edit?usp=sharing)
