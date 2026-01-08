@@ -1,0 +1,13 @@
+{
+  "type": "service_account",
+  "project_id": "uvol-bolmasin",
+  "private_key_id": "b547ea0bac12bdb15f0bc0dbbd925997a96029a0",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDYvMXca9ruWL55\nqHtjmDRYBp+BF1ze8ya3yLnJ1WVqqRoQn/gRCrxmNeUdmfAzhpkHjS29CL9qKt2K\nlht7Y0rgWn5oII1bE918AVtr7JTJ8Juq2sscO0nDu3WUxAParJkZA3d8pudYF+VU\n3RFmhTcB+/38Ozr6nKYzUec8Q+z/RcKIFlRC+Uc6nNkiAo+EXqzCn8LxE3qsfG+H\n5ENhK3GDce/e9BTQ7Xm4IYk+EZ0zzEPgYYEgjakAVFzUOZ6Wh4/vUSe6AgjPm0AG\nJrGOH8U1hJfba4kWyqg5npfMYe9y+P0esGTXO+jS3GVoPFfX6hG8rYAR6pRw5fGI\n6ULy0ckDAgMBAAECggEAXb44bkAQL2se54vh4o/gg/pJXxJ1ztCofHFLOmscNGfz\nqCEosGZOWn8RHB6K8B5Vbhi4Ibz43biwndKTDGlD54n8hpkdyrjq4UnM+v8W08lH\n6zw7AXj7TLd2AeROLnTcux7uvXGLOmULggskDY2s3yTZFBGiTucWU7gnJb/TcA02\nANAlYKzLAnxSvv9qQdmGOq1NtJjWWYmmWelIOuUbC9B/AlropbnAlk1kXzlpQqh4\nKBC55nii8ib9bDNtxM05lygN0+kkg+uD2+yDB/CmRIk/b2P85eljepIcP+et0XBo\nl2mZDnjMcWphn4sGYn5aYRkoVK9wRuRmPPnDPlnmUQKBgQD7zBSPDSJOAUT6Cbgo\nxlsGNk1O08uEiOte1fgCXyVmMK5yPNKJN5brREgbVokGmb7wrpY2/FyfhJQZCO6u\nas/IIhg6Sv0XSdKlCYVf0kJmfh7T7ggUe1LlN9fH5JLCUP9eM/UYePaRjo9mV8VA\nXa3zO69jIy7EATCmaigHsHmbnwKBgQDcWuIow3LD+3L0QJGOagaKNMudC4Cv8dKP\nlo+8iSxfmDx3TcMD3xwoU5uhoUEXrQUnQvtM0mZPBFcgc/0pSEioBrfzxiBEp51L\nIzVVO+BrsVCYqWyqLn58i6In5+sV26x5ulKIEHDYYC6NN4vvvopk6qBbDQts0ZCU\niCZKDSPYHQKBgQCXrE3yAZJZdJBNIU+qWBl6e3lD83ZTZnqJTNAw9Yk8rjRWoeac\nOz0QiLf6p7ywmioXJsNbadaNTDo9flDwBW0V+9umOYeM4K4fNcX+e1P+ExiUxnxd\ngg/j/Shgw4HXxRyebSPFUxALi9k7Z8FszUE8FAbI6+d+r8zTYXytbRNDtwKBgQDS\nD0VnTKJ8F5lHJMJdO8+OMrQjupJrp6BtRz8woKePXaXOqW+NokPKYaGMHBfcRRET\nk3PSkQP8sYuJIWkl0IWKwBTeK3IZYJu+xAqUfSb8IqVNUr2HIhlsCwSC/EALr0Ul\nKayBjwK0EkRuVJRu8Honp89D3RSWINSt83hkwU/5NQKBgQCvwfngGngUTAOV5D66\nZRBwyRD04dZIAIfny6sgP1l2FcpxCbR9GEgmiY2QLCMyATYsZYFUUXlORDe5NsgI\nBlBoI8rcov2Pd22ZHrJZIZjWB1nNR7EjSm1oLgydszotCsuGgydOPw5K2jecRHEI\nXVNoO9oex0lHseNxyYdPmVo11g==\n-----END PRIVATE KEY-----\n",
+  "client_email": "uvol-bo-lmasin-service-account@uvol-bolmasin.iam.gserviceaccount.com",
+  "client_id": "107272043732707095897",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/uvol-bo-lmasin-service-account%40uvol-bolmasin.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}
